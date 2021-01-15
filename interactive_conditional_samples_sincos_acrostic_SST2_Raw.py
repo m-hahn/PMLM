@@ -296,8 +296,8 @@ class BertModel(object):
       self.sequence_output = self.all_encoder_layers[-1]
       predicted_logit = get_predict_output(config, self.embedding_table, self.sequence_output, start_token_idx, mpos_list,start_list_idx, past)
 
-
-      predicted_logit = tf.expand_dims(predicted_logit, 0) 
+      print("STEP", predicted_logit)
+      predicted_logit = tf.expand_dims(predicted_logit, 1) 
       return predicted_logit, past, start_list_idx+1, mpos_list
 
     def cond(past, predicted_logit,start_list_idx, sequence_predict,mpos_list):
@@ -336,10 +336,10 @@ class BertModel(object):
       ],
         #BNTH
       shape_invariants=[
-        tf.TensorShape([12, 2,1, 12,None, 64]),
-        tf.TensorShape([1,None]),
+        tf.TensorShape([12, 2,batch_size, 12,None, 64]),
+        tf.TensorShape([batch_size,None]),
         tf.TensorShape([]),
-        tf.TensorShape([1,None]),
+        tf.TensorShape([batch_size,None]),
         tf.TensorShape([None])
       ],
       back_prop = False,
@@ -1339,18 +1339,22 @@ class BertModelDemo():
     order: The order to generate sentences l2r refers to left to right. r2l refers to right to left. random refers to random order.
     """
     context_tokens = [101]
+    text_base = "The [MASK] is a [MASK] movie ."
     num_texts = len(raw_text)
     avg_text = int(128/num_texts)
-#    for i in range(0, 1):
- #     single_text = BertModel.encodetext(raw_text[0], vocab_file = self.vocab_file, do_lower_case = self.do_lower_case)
-  #    context_tokens.extend(single_text)
-   #   context_tokens.extend([103]*avg_text)
-    for i in range(0,num_texts-1):
-      single_text = BertModel.encodetext(raw_text[i], vocab_file = self.vocab_file, do_lower_case = self.do_lower_case)
+    text_base = text_base.split(" ")
+    text_length = len(text_base)
+    for word in text_base:
+      if word == "[MASK]":
+         single_text = [103]
+      else:
+         single_text = BertModel.encodetext(word, vocab_file = self.vocab_file, do_lower_case = self.do_lower_case)
+      print("single_text", single_text)
       context_tokens.extend(single_text)
-      context_tokens.extend([103]*avg_text)
-    context_tokens.extend([103]*100) 
+    context_tokens.extend([103]*(128-len(context_tokens)))
+#    context_tokens.extend([103]*100) 
     input_context_tokens = context_tokens[:128]
+    order = "l2r"
 
     print("input_context_tokens", input_context_tokens)
     input_mpos_list = []
@@ -1358,29 +1362,25 @@ class BertModelDemo():
       if input_context_tokens[i] == 103:
         input_mpos_list.append(i)
 
-    assert order in ["l2r","r2l","random"]
-    if order == "r2l":
-      input_mpos_list.reverse()
-    elif order == "random":
-      random.shuffle(input_mpos_list)
     print ("The order for generation is:")
     print (input_mpos_list)
-
-    for _ in range(self.nsamples // self.batch_size):
+    for _ in range(text_length):
       out_combo = self.sess.run(self.output, feed_dict={
               self.input_ids: [input_context_tokens for _ in range(self.batch_size)], 
               self.mpos_list: input_mpos_list
               })
+      print("OUT_COMBO", out_combo)
       out = out_combo[0][0]
       mpos = out_combo[1]
-    final_output =  (' '.join(BertModel.decodetext(out,vocab_file=self.vocab_file,do_lower_case = self.do_lower_case)))
-    context_input =  (' '.join(BertModel.decodetext(input_context_tokens,vocab_file=self.vocab_file,do_lower_case = self.do_lower_case)))
-    print ("The generated text is:")
-    print (final_output.replace(" ##",""))
-    print ("\n")
+    for i in range(self.batch_size):
+       final_output =  (' '.join(BertModel.decodetext(out_combo[0][i],vocab_file=self.vocab_file,do_lower_case = self.do_lower_case)))
+       #context_input =  (' '.join(BertModel.decodetext(input_context_tokens,vocab_file=self.vocab_file,do_lower_case = self.do_lower_case)))
+       print ("The generated text is:")
+       print (final_output.replace(" ##",""))
+       print ("\n")
     return 
 if __name__ == '__main__':
-  demo = BertModelDemo()
+  demo = BertModelDemo(batch_size=4, nsamples=4)
 #  for i in range(3):
 #    demo.generate_text([""], order = "l2r") # freely generate texts in left-to-right order
  #   demo.generate_text(["Tom is a cat and Jerry is a mouse."], order = "l2r") # generate texts given the begining in left-to-right order

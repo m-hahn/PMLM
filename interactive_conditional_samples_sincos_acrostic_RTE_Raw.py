@@ -1469,13 +1469,14 @@ if __name__ == '__main__':
 
 blankCandidates = []
 
-for group in ["", "_d", "_e"]:
+for group in ["_c"]:
  try:
-  with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev_alternatives_c_sentBreak_new_finetuned_large{group}.tsv", "r") as inFile:
+  with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/RTE/dev_alternatives{group}.tsv", "r") as inFile:
    for line in inFile:
        if line.startswith("####"):
           next(inFile)
-          tokenized = next(inFile).strip() # tokenized by the original XLNET tokenizer
+          boundary = int(next(inFile).strip())
+          tokenized = next(inFile).strip()
           print("TOK", tokenized)
           line = next(inFile)
        if len(line) < 3:
@@ -1485,14 +1486,19 @@ for group in ["", "_d", "_e"]:
        except ValueError:
           continue
        sampled = sampled.strip().split(" ")
+       assert len(sampled) == len(tokenized.split(" ")), (sampled, tokenized)
        mask = mask.strip()
        assert len(sampled) == len(mask), (sampled, mask)
        masked = [sampled[i] if mask[i] == "0" else "[MASK]" for i in range(len(mask))]
+       masked = masked[:boundary] + ["▁[SEP]", "▁[CLS]"] + masked[boundary:] # "▁[CLS]"
+       #print(masked)
        masked = "".join(masked).replace("▁", " ").replace("[MASK]", " [MASK] ").replace("  ", " ").replace("</s>", "").strip()
        #print(("CANDIDATE", (tokenized, mask, masked)))
        encodedWithMask = demo.encodeInputWithMask(masked, withCaching=True)
+#       lengthOfFirstPartPMLM = encodedWithMask.index(102)
+ #      encodedWithMask = encodedWithMask[:lengthOfFirstPartPMLM] + encodedWithMask[lengthOfFirstPartPMLM+1:]
        maskString = "".join(["0" if x != 103 else "1" for x in encodedWithMask])
-       blankCandidates.append({"tokenized" : tokenized, "XLNET_Mask" : mask, "masked" : masked, "PMLM_Encoded" : encodedWithMask, "PMLM_Mask_Encoded" : maskString})
+       blankCandidates.append({"tokenized" : tokenized, "XLNET_Mask" : mask, "masked" : masked, "PMLM_Encoded" : encodedWithMask, "PMLM_Mask_Encoded" : maskString}) #, "lengthOfFirstPartPMLM" : lengthOfFirstPartPMLM})
        #print(blankCandidates[-1])
        if len(blankCandidates) % 1000 == 0:
           #break
@@ -1525,7 +1531,7 @@ print(sum([len(x) for x in BATCHES])/len(BATCHES))
 import random
 random.shuffle(BATCHES)
 count = 0
-with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev_alternatives_PMLM_{MODEL_NAME.split('/')[-2]}_raw.tsv", "w") as outFile:
+with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/RTE/dev_alternatives_PMLM_{MODEL_NAME.split('/')[-2]}_raw.tsv", "w") as outFile:
   for batch in BATCHES:
      count += 1
      if count % 100:

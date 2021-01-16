@@ -22,29 +22,6 @@ import numpy as np
 import tensorflow as tf
 import tokenization
 
-def top_k_logits(logits, k):
-  if k == 0:
-    # no truncation
-    return logits
-
-  logits_shape = logits.shape
-  mask = tf.one_hot([100]*logits_shape[0],depth=logits_shape[1],on_value=1e10,off_value=1.0,dtype=logits.dtype)
-  logits = logits*mask
-
-  def _top_k():
-    values, _ = tf.nn.top_k(logits, k=k)
-    min_values = values[:, -1, tf.newaxis]
-    return tf.where(
-        logits < min_values,
-        tf.ones_like(logits, dtype=logits.dtype) * -1e10,
-        logits,
-    )
-  return tf.cond(
-     tf.equal(k, 0),
-     lambda: logits,
-     lambda: _top_k(),
-  )
-
 
 class BertConfig(object):
   """Configuration for `BertModel`."""
@@ -155,6 +132,7 @@ class BertModel(object):
                is_training,
                init_input_ids,
                init_mpos_list,
+               purt = None,
                input_mask=None,
                token_type_ids=None,
                use_one_hot_embeddings=True,
@@ -178,9 +156,11 @@ class BertModel(object):
       ValueError: The config is invalid or one of the input tensor shapes
         is invalid.
     """
-    def get_predict_output(bert_config, embedding_table,sequence_output,start_token_idx, mpos_list,start_list_idx, past):
+
+
+    def get_output_logits(bert_config, embedding_table,sequence_output):
       """Get loss and log probs for the masked LM."""
-      input_tensor = sequence_output[:,start_token_idx,:]
+      input_tensor = sequence_output #[:,start_token_idx,:]
       """
       if past == None :
         input_tensor = sequence_output[:, start_token_idx,:]
@@ -188,7 +168,7 @@ class BertModel(object):
         input_tensor = sequence_output[:, 1,:]
       """
 
-
+      print("INPUT TENSOR", input_tensor)
       #if start_token_idx == 52:
       #else:
       #input_tensor = sequence_output[:, 1,:]
@@ -204,7 +184,9 @@ class BertModel(object):
             activation=get_activation(bert_config.hidden_act),
             kernel_initializer=create_initializer(
               bert_config.initializer_range))
+          print("INPUT TENSOR", input_tensor)
           input_tensor = layer_norm(input_tensor)
+          print("INPUT TENSOR", input_tensor)
 
         # The output weights are the same as the input embeddings, but there is
         # an output-only bias for each token.
@@ -212,14 +194,11 @@ class BertModel(object):
           "output_bias",
           shape=[bert_config.vocab_size],
           initializer=tf.zeros_initializer())
-        logits = tf.matmul(input_tensor, embedding_table, transpose_b=True)
+        print(input_tensor, embedding_table, output_bias)
+        logits = tf.einsum('ijk,lk->ijl', input_tensor, embedding_table)
         logits = tf.nn.bias_add(logits, output_bias)
-        log_probs = tf.nn.log_softmax(logits, axis=-1)/tf.to_float(bert_config.temperature)
+        return logits
 
-        topk_output_ids = top_k_logits(log_probs, k = 40)
-        output_id = tf.multinomial(topk_output_ids, num_samples=1, output_dtype=tf.int32)
-        output_id = tf.squeeze(output_id, axis=1)
-      return output_id
 
     config = copy.deepcopy(config)
     if not is_training:
@@ -238,115 +217,77 @@ class BertModel(object):
       token_type_ids = tf.zeros(shape=[batch_size, init_seq_length], dtype=tf.int32)
 
 
-    def step(input_ids,past = None, start_list_idx = None, mpos_list = None):
-      start_token_idx = mpos_list[start_list_idx]
-      with tf.variable_scope("bert", reuse=tf.AUTO_REUSE):
-        with tf.variable_scope("embeddings"):
-          # Perform embedding lookup on the word ids.
-          (self.embedding_output, self.embedding_table) = embedding_lookup(
-              input_ids=input_ids,
-                vocab_size=config.vocab_size,
-                embedding_size=config.hidden_size,
-                initializer_range=config.initializer_range,
-                word_embedding_name="word_embeddings",
-                use_one_hot_embeddings=use_one_hot_embeddings)
+    with tf.variable_scope("bert", reuse = tf.AUTO_REUSE):
+      with tf.variable_scope("embeddings"):
+        # Perform embedding lookup on the word ids.
+        (self.embedding_output, self.embedding_table) = embedding_lookup(
+            input_ids=init_input_ids,
+            vocab_size=config.vocab_size,
+            embedding_size=config.hidden_size,
+            initializer_range=config.initializer_range,
+            word_embedding_name="word_embeddings",
+            use_one_hot_embeddings=use_one_hot_embeddings)
 
-            # Add positional embeddings and token type embeddings, then layer
-            # normalize and perform dropout.
-          self.embedding_output = embedding_postprocessor(
-                input_tensor=self.embedding_output,
-                use_token_type=use_token_type,
-                token_type_ids=token_type_ids,
-                token_type_vocab_size=config.type_vocab_size,
-                token_type_embedding_name="token_type_embeddings",
-                use_position_embeddings=False,
-                position_embedding_name="position_embeddings",
-                initializer_range=config.initializer_range,
-                max_position_embeddings=config.max_position_embeddings,
-                dropout_prob=config.hidden_dropout_prob,
-                start_token_idx = start_token_idx
-                )
+        # Add positional embeddings and token type embeddings, then layer
+        # normalize and perform dropout.
+        self.embedding_output = embedding_postprocessor(
+            input_tensor=self.embedding_output,
+            use_token_type=True,
+            token_type_ids=token_type_ids,
+            token_type_vocab_size=config.type_vocab_size,
+            token_type_embedding_name="token_type_embeddings",
+            use_position_embeddings=False, # in accordance with step()
+            position_embedding_name="position_embeddings",
+            initializer_range=config.initializer_range,
+            max_position_embeddings=config.max_position_embeddings,
+            dropout_prob=config.hidden_dropout_prob)
+
+        if purt is not None:
+          self.embedding_output = self.embedding_output + purt
+      with tf.variable_scope("encoder"):
+        # This converts a 2D mask of shape [batch_size, seq_length] to a 3D
+        # mask of shape [batch_size, seq_length, seq_length] which is used
+        # for the attention scores.
+        attention_mask = create_attention_mask_from_input_mask(
+            init_input_ids, input_mask)
+
+        print("all_encoder_layers, line 319", self.embedding_output)
+
+        # Run the stacked transformer.
+        # `sequence_output` shape = [batch_size, seq_length, hidden_size].
+        self.all_encoder_layers = transformer_model(
+            input_tensor=self.embedding_output,
+            attention_mask=attention_mask,
+            hidden_size=config.hidden_size,
+            num_hidden_layers=config.num_hidden_layers,
+            num_attention_heads=config.num_attention_heads,
+            intermediate_size=config.intermediate_size,
+            intermediate_act_fn=get_activation(config.hidden_act),
+            hidden_dropout_prob=config.hidden_dropout_prob,
+            attention_probs_dropout_prob=config.attention_probs_dropout_prob,
+            initializer_range=config.initializer_range,
+            do_return_all_layers=True,
+#            use_relative_position=config.use_relative_position,
+            start_token_idx = None
+            )
 
 
-        with tf.variable_scope("encoder"):
-            # This converts a 2D mask of shape [batch_size, seq_length] to a 3D
-            # mask of shape [batch_size, seq_length, seq_length] which is used
-            # for the attention scores.
-            #attention_mask = create_attention_mask_from_input_mask(
-            #    input_ids, input_mask)
-
-            # create a mask for gpt : 1's in the lower triangle, counting from the lower right corner--by liaoyi
-          attention_mask = create_attention_mask_from_input_mask(input_ids,input_mask,start_token_idx = start_token_idx)
-
-            # Run the stacked transformer.
-            # `sequence_output` shape = [batch_size, seq_length, hidden_size].
-          self.all_encoder_layers, past = transformer_model(
-                input_tensor=self.embedding_output,
-                attention_mask=None,
-                hidden_size=config.hidden_size,
-                num_hidden_layers=config.num_hidden_layers,
-                num_attention_heads=config.num_attention_heads,
-                intermediate_size=config.intermediate_size,
-                intermediate_act_fn=get_activation(config.hidden_act),
-                hidden_dropout_prob=config.hidden_dropout_prob,
-                attention_probs_dropout_prob=config.attention_probs_dropout_prob,
-                initializer_range=config.initializer_range,
-                do_return_all_layers=True,
-                past = past,
-                start_token_idx = start_token_idx
-                )
+      print("all_encoder_layers, line 338", self.all_encoder_layers)
       self.sequence_output = self.all_encoder_layers[-1]
-      predicted_logit = get_predict_output(config, self.embedding_table, self.sequence_output, start_token_idx, mpos_list,start_list_idx, past)
+      # The "pooler" converts the encoded sequence tensor of shape
+      # [batch_size, seq_length, hidden_size] to a tensor of shape
+    self.predicted_logit = get_output_logits(config, self.embedding_table, self.sequence_output)
 
-      print("STEP", predicted_logit)
-      predicted_logit = tf.expand_dims(predicted_logit, 1) 
-      return predicted_logit, past, start_list_idx+1, mpos_list
 
-    def cond(past, predicted_logit,start_list_idx, sequence_predict,mpos_list):
-      #return start_list_idx <= tf.shape(mpos_list)[0]
-      return start_list_idx < tf.shape(init_mpos_list)[0]
-      #return start_list_idx < 481
+#      print("PREDICTION", self.predicted_logit)
 
-    def body(past, predicted_logit, start_list_idx, sequence_predict, mpos_list):
-      new_predicted_logit, new_past, new_start_list_idx, mpos_list = step(predicted_logit, past=past, 
-                                                                start_list_idx=start_list_idx, mpos_list=mpos_list)
-      sequence_predict = tf.concat([sequence_predict,new_predicted_logit], axis =1)
-      next_mask_label = tf.fill(new_predicted_logit.shape,103)
-      new_predicted_logit = tf.concat([predicted_logit[:,:mpos_list[new_start_list_idx-1]], new_predicted_logit, predicted_logit[:,mpos_list[new_start_list_idx-1]+1:]], axis=1)
-      return [new_past, new_predicted_logit, 
-              new_start_list_idx, sequence_predict, mpos_list]
+
+
 
 
     self.rtmpos= init_mpos_list
 
-    init_predict, init_past, init_start_list_idx,init_mpos_list = step(init_input_ids,past=None,start_list_idx=0,mpos_list=init_mpos_list)
 
-    init_seq = init_predict
-    next_mask_label = tf.fill(init_predict.shape,103)
-    init_predict = tf.concat([init_input_ids[:,:init_mpos_list[init_start_list_idx-1]], init_predict, init_input_ids[:,init_mpos_list[init_start_list_idx-1]+1:]], axis=1)
-
-    print ("finish init")
-    _,self.finalized_logit,_,self.predicted_tokens,_ = tf.while_loop(
-      cond=cond,
-      body=body,
-      loop_vars = [
-        init_past,
-        init_predict,
-        init_start_list_idx,
-        init_seq,
-        init_mpos_list
-      ],
-        #BNTH
-      shape_invariants=[
-        tf.TensorShape([12, 2,batch_size, 12,None, 64]),
-        tf.TensorShape([batch_size,None]),
-        tf.TensorShape([]),
-        tf.TensorShape([batch_size,None]),
-        tf.TensorShape([None])
-      ],
-      back_prop = False,
-      maximum_iterations = tf.shape(init_mpos_list)[0]
-    )
   @classmethod
   def encodetext(cls, text, vocab_file,do_lower_case):
     global TOKENIZER
@@ -367,9 +308,6 @@ class BertModel(object):
         vocab_file=vocab_file, do_lower_case=do_lower_case)
     return TOKENIZER.convert_ids_to_tokens(text)
 
-  def get_predicted_tokens(self):
-    return self.finalized_logit,self.rtmpos
-    #return self.predicted_tokens
   def get_pooled_output(self):
     return self.pooled_output
 
@@ -888,8 +826,9 @@ def attention_layer(from_tensor,
   if attention_mask is not None:
     # `attention_mask` = [B, 1, F, T]
     attention_mask = tf.expand_dims(attention_mask, axis=[1])
-
-    attention_mask = attention_mask[:,:,start_token_idx-1:start_token_idx+1,:]
+    
+    if start_token_idx is not None:
+       attention_mask = attention_mask[:,:,start_token_idx-1:start_token_idx+1,:]
     #attention_mask = attention_mask[:,:,:,:]
 
     # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
@@ -1190,16 +1129,16 @@ def transformer_model(input_tensor,
         layer_output = layer_norm(layer_output + attention_output)
         prev_output = layer_output
         all_layer_outputs.append(layer_output)
-  past_layers = tf.stack(past_layers,axis=0)
+
   if do_return_all_layers:
     final_outputs = []
     for layer_output in all_layer_outputs:
       final_output = reshape_from_matrix(layer_output, input_shape)
       final_outputs.append(final_output)
-    return final_outputs, past_layers
+    return final_outputs
   else:
     final_output = reshape_from_matrix(prev_output, input_shape)
-    return final_output, past_layers
+    return final_output
 
 
 def get_shape_list(tensor, expected_rank=None, name=None):
@@ -1295,15 +1234,11 @@ def assert_rank(tensor, expected_rank, name=None):
         "`%d` (shape = %s) is not equal to the expected rank `%s`" %
         (name, scope_name, actual_rank, str(tensor.shape), str(expected_rank)))
 
-MODEL_NAME='/u/scr/mhahn/PMLM/1billion/1billion'
-#MODEL_NAME='/u/scr/mhahn/PMLM/wikitext/wikitext103',
-#MODEL_NAME='/u/scr/mhahn/PMLM/u-PMLM-R/model.ckpt-600000'
 
 
 class BertModelDemo():
   def __init__(self,
-#      model_name='/u/scr/mhahn/PMLM/wikitext/wikitext103',
-      model_name=MODEL_NAME,
+      model_name='/u/scr/mhahn/PMLM/wikitext/wikitext103',
       #model_name='1billion',
       seed=None,
       nsamples=1,
@@ -1337,7 +1272,7 @@ class BertModelDemo():
     np.random.seed(seed)
     tf.set_random_seed(seed)
     print ("finish build graph")
-    self.output = self.model.get_predicted_tokens()
+    self.output = self.model.predicted_logit
     saver = tf.train.Saver()
     print ("start restoring para")
     self.sess = tf.Session()
@@ -1354,10 +1289,6 @@ class BertModelDemo():
       for word in text_base_list:
         if word == "[MASK]":
            single_text = [103]
-        elif word == "[CLS]":
-           single_text = [101]
-        elif word == "[SEP]":
-           single_text = [102]
         else:
            single_text = BertModel.encodetext(word, vocab_file = self.vocab_file, do_lower_case = self.do_lower_case)
 #        print("single_text", single_text)
@@ -1412,7 +1343,9 @@ class BertModelDemo():
     return 
 
 
-  def  generate_text_from_numeric(self, numeric):
+  def  training_step(self, numeric):
+    numeric = [self.encodeInputWithMask(x) for x in numeric]
+
     numeric_original = [x[::] for x in numeric]
     TEXT_LENGTH = max(len(x) for x in numeric)
     assert len(numeric) == BATCH_SIZE
@@ -1461,17 +1394,259 @@ class BertModelDemo():
 
 
 
-BATCH_SIZE=16
+BATCH_SIZE=32
 if __name__ == '__main__':
   demo = BertModelDemo(batch_size=BATCH_SIZE, nsamples=BATCH_SIZE)
-#  demo.generate_text(["The","quick","brown","fox","jumps","over","the","lazy","dog"],order= "random") # generate texts containing the tokens in right-to-left order
+  demo.generate_text(["The","quick","brown","fox","jumps","over","the","lazy","dog"],order= "random") # generate texts containing the tokens in right-to-left order
+  demo.training_step(["This is a [MASK] piece of [MASK] ." for _ in range(BATCH_SIZE)]) # generate texts containing the tokens in right-to-left order
 
+
+#import dataloader
+
+assert args.dataset == "SST2"
+
+sentences = []
+with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev.tsv", "r") as inFile:
+  header = next(inFile) # for the header
+  assert header == "sentence\tlabel\n"
+  for line in inFile:
+     line = line.strip().split("\t")
+     if len(line) < 2:
+       continue
+     assert len(line) == 2
+     sentences.append(line[0])
+
+
+from transformers import AutoTokenizer, AutoModelWithLMHead
+
+tokenizer = AutoTokenizer.from_pretrained("roberta-large")
+
+model = AutoModelWithLMHead.from_pretrained("roberta-large").cuda()
+			
+from transformers import pipeline
+
+#unmasker = pipeline('fill-mask', model='bert-base-uncased')
+
+#print(unmasker("hello i'm a <mask> model."))
+assert tokenizer.mask_token == "<mask>"
+
+sequences = []
+sequences.append(f"Distilled {tokenizer.mask_token} are smaller than the models they mimic. Using them instead of the large versions would help lower our carbon footprint.")
+sequences.append(f"This is a massive blockbuster crunchalic {tokenizer.mask_token} movie.")
+
+inputs = [tokenizer.encode(x, return_tensors="pt")[0] for x in sequences]
+maxLength = max([x.size()[0] for x in inputs])
+for i in range(len(inputs)):
+    inputs[i] = torch.cat([inputs[i], torch.LongTensor([tokenizer.convert_tokens_to_ids("<pad>") for _ in range(maxLength - inputs[i].size()[0])])])
+    print([tokenizer.convert_ids_to_tokens(int(x)) for x in inputs[i]])
+
+
+
+
+input = torch.stack(inputs, dim=0)
+token_logits = model(input.cuda())
+print(token_logits)
+token_logits = token_logits[0]
+print(token_logits)
+print(token_logits.size())
+
+import torch
+print(torch.cuda.is_available())
+
+mask_token_index = (input == tokenizer.mask_token_id)
+print(mask_token_index)
+print([[bool(y) for y in x] for x in mask_token_index])
+print([True in [bool(y) for y in x] for x in mask_token_index])
+
+
+def trueIndex(x):
+   print(x)
+   print(True in x)
+   return (x.index(True))
+mask_token_index = [trueIndex([bool(y) for y in x]) for x in mask_token_index]
+print(mask_token_index)
+
+mask_token_logits = token_logits[0, mask_token_index[0], :]
+mask_token_logits = torch.stack([token_logits[i, mask_token_index[i], :] for i in range(len(mask_token_index))], dim=0)
+print(mask_token_logits)
+
+
+import torch.nn.functional as F
+
+for i in range(2):
+  top_5_tokens = torch.topk(mask_token_logits[i], 5, dim=0).indices.tolist()
+  for token in top_5_tokens:
+    print(sequences[i].replace(tokenizer.mask_token, tokenizer.decode([token])))
+
+                                                                                                                   
+probs = F.softmax(mask_token_logits, dim=-1).squeeze(1)      
+
+for _ in range(10):                                                                                                                          
+ next_token = torch.multinomial(probs, num_samples=1).squeeze(1)     
+ print(next_token.size())
+ for i in next_token:
+    print(tokenizer.decode([int(i)]))
+
+
+import re
+
+#quit()
+
+
+sentences = []
+with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/train.tsv", "r") as inFile:
+  header = next(inFile) # for the header
+  assert header == "sentence\tlabel\n"
+#  next(inFile)
+  for line in inFile:
+     line = line.strip().split("\t")
+     if len(line) < 2:
+       continue
+     assert len(line) == 2
+     sentences.append(line[0])
+random.shuffle(sentences)
+
+sentences_dev = []
+with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev.tsv", "r") as inFile:
+  header = next(inFile) # for the header
+  assert header == "sentence\tlabel\n"
+  for line in inFile:
+     line = line.strip().split("\t")
+     if len(line) < 2:
+       continue
+     assert len(line) == 2
+     sentences_dev.append(line[0])
+
+
+
+GENERATION_VOCABULARY_MASK = torch.cuda.FloatTensor([float("-inf") if ("<unk>" == tokenizer.convert_ids_to_tokens(x)) else 0 for x in range(30522)]).view(1, 1, -1)
 
 blankCandidates = []
 
-for group in ["", "_d", "_e"]:
- try:
-  with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev_alternatives_c_sentBreak_new_finetuned_large{group}.tsv", "r") as inFile:
+from transformers import AdamW
+LR = random.choice([2e-6, 5e-6, 1e-5, 2e-5, 5e-5, 1e-4])
+
+optimizer = AdamW(model.parameters(),
+                  lr = LR, # args.learning_rate - default is 5e-5, our notebook had 2e-5
+                  eps = 1e-8 # args.adam_epsilon  - default is 1e-8.
+                )
+
+
+from transformers import get_linear_schedule_with_warmup
+
+# Number of training epochs. The RoBERTa authors recommend between 2 and 4. 
+# We chose to run for 4, but we'll see later that this may be over-fitting the
+# training data.
+epochs = random.choice([1,2,3,4])
+
+BATCH = random.choice([4, 8, 16, 32]) # , 64, 128
+
+# Total number of training steps is [number of batches] x [number of epochs]. 
+# (Note that this is not the same as the number of training samples).
+total_steps = int(len(sentences)/BATCH * epochs)
+
+# Create the learning rate scheduler.
+scheduler = get_linear_schedule_with_warmup(optimizer, 
+                                            num_warmup_steps = 0, # Default value in run_glue.py
+                                            num_training_steps = total_steps)
+
+# http://mccormickml.com/2019/07/22/RoBERTa-fine-tuning/#4-train-our-classification-model
+
+model.train()
+
+
+ce_loss = torch.nn.CrossEntropyLoss(reduction="mean", ignore_index=-100)
+model.zero_grad()    
+
+def runOnCorpus(sents, doTraining):
+    if doTraining:
+       model.train()
+    else:
+        model.eval()
+    sents = sents[::]
+    random.shuffle(sents)
+    losses = []
+    counter = 0
+    sentsNum = len(sents)
+    while len(sents) > 0:
+      counter += BATCH
+      inputs = [tokenizer.encode(x, return_tensors="pt").view(-1) for x in sents[:BATCH]]
+      sents = sents[BATCH:]
+#      print(inputs)
+ #     print([x.size()[0] for x in inputs]) 
+
+
+      masked = [[(i, int(x[i])) for i in range(1,x.size()[0]-1) if random.random() < 0.2] for x in inputs]
+      for i in range(len(inputs)):
+        for j, _ in masked[i]:
+           inputs[i][j] = tokenizer.convert_tokens_to_ids("<mask>")
+#      if doTraining:
+ #        print(tokenizer.decode(inputs[0]))
+
+      maxLength = max([x.size()[0] for x in inputs])
+      for i in range(len(inputs)):
+          inputs[i] = torch.cat([inputs[i], torch.LongTensor([tokenizer.convert_tokens_to_ids("<pad>") for _ in range(maxLength - inputs[i].size()[0])])])
+
+   #   print([x.size()[0] for x in inputs]) 
+      inputs = torch.stack(inputs, dim=0)
+      inputs = inputs.cuda()
+      # now do masking
+ #     print(inputs[0])
+  #    print(inputs[1])
+
+      token_logits = model(inputs.cuda())
+    #  print(token_logits)
+      token_logits = token_logits[0]
+      targets = [[-100 for _ in range(maxLength)] for _ in range(len(masked))]
+      for i in range(len(masked)):
+         for j, targ in masked[i]:
+            targets[i][j] = targ
+   #   print(masked[0])
+  #    print(targets[0])
+ #     print(inputs[0])
+#      quit()
+      targets = torch.cuda.LongTensor(targets)
+      lossHere = ce_loss(token_logits.view(-1, token_logits.size()[-1]), targets.view(-1))
+#      print(targets[0])     
+#      print(lossHere)
+      losses.append(float(lossHere))                                                                                                        
+ #      ceLoss = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=6)(next_token_logits.view(-1, 32000), input_ids[:, LENGTH_OF_INITIAL_PART:].contiguous().view(-1))                                 
+  #    # print(ceLoss)                                                                                                                                                                                       
+   #    loss = ceLoss.mean()                                                                                                                                                                                 
+                                                                                                                                                                                                            
+      if doTraining:                                                                                                                                                                                       
+          model.zero_grad()                                                                                                                                                                                 
+          lossHere.backward()    
+          torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)                                                                                                                                           
+          optimizer.step()                                                                                                                                                                                  
+          scheduler.step()  # Update learning rate schedule                                                                                                                                                 
+      if random.random() < 0.2:
+        print(devLosses, float(lossHere), doTraining, (counter)/sentsNum, total_steps, epochs, LR, BATCH)
+    return sum(losses)/len(losses)
+
+devLosses = []
+
+model.eval()
+devLosses.append(runOnCorpus(sentences_dev, False))
+myID = random.randint(100,100000)
+
+for i in range(5):
+   model.train()
+   runOnCorpus(sentences, True)
+   model.eval() 
+   devLosses.append(runOnCorpus(sentences_dev, False))
+   with open(f"output/{__file__}_{myID}.txt", "w") as outFile:
+        print(devLosses, file=outFile)
+        print(total_steps, epochs, LR, BATCH, file=outFile)
+   if devLosses[-1] > devLosses[-2]:
+      break
+
+quit()
+
+blankCandidates = []
+
+try:
+ with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev_alternatives_c_sentBreak_new_finetuned_large.tsv", "r") as inFile:
    for line in inFile:
        if line.startswith("####"):
           next(inFile)
@@ -1497,7 +1672,7 @@ for group in ["", "_d", "_e"]:
        if len(blankCandidates) % 1000 == 0:
           #break
           print("Recording blank candidates", len(blankCandidates))
- except StopIteration:
+except StopIteration:
     pass
 
 print(len(blankCandidates))
@@ -1522,10 +1697,12 @@ while i < len(blankCandidates):
    i = j+1
 print(len(BATCHES))
 print(sum([len(x) for x in BATCHES])/len(BATCHES))
-import random
-random.shuffle(BATCHES)
+
+
+quit()
+
 count = 0
-with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev_alternatives_PMLM_{MODEL_NAME.split('/')[-2]}_raw.tsv", "w") as outFile:
+with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev_alternatives_PMLM_Wikitext_finetune.tsv", "w") as outFile:
   for batch in BATCHES:
      count += 1
      if count % 100:

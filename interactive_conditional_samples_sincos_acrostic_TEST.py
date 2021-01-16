@@ -124,8 +124,6 @@ class BertConfig(object):
     return json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
 
 
-TOKENIZER=None
-
 class BertModel(object):
   """BERT model ("Bidirectional Encoder Representations from Transformers").
 
@@ -349,23 +347,19 @@ class BertModel(object):
     )
   @classmethod
   def encodetext(cls, text, vocab_file,do_lower_case):
-    global TOKENIZER
-    if TOKENIZER is None:
-      TOKENIZER = tokenization.FullTokenizer(
-        vocab_file=vocab_file, do_lower_case=do_lower_case)
+    tokenizer = tokenization.FullTokenizer(
+      vocab_file=vocab_file, do_lower_case=do_lower_case)
     unicode_text = tokenization.convert_to_unicode(text)
-    tokenized = TOKENIZER.tokenize(unicode_text)
+    tokenized = tokenizer.tokenize(unicode_text)
     #bos = ["[CLS]"]
     #bos.extend(tokenized)
-    return TOKENIZER.convert_tokens_to_ids(tokenized)
+    return tokenizer.convert_tokens_to_ids(tokenized)
 
   @classmethod
   def decodetext(cls, text, vocab_file, do_lower_case):
-    global TOKENIZER
-    if TOKENIZER is None:
-      TOKENIZER = tokenization.FullTokenizer(
-        vocab_file=vocab_file, do_lower_case=do_lower_case)
-    return TOKENIZER.convert_ids_to_tokens(text)
+    tokenizer = tokenization.FullTokenizer(
+      vocab_file=vocab_file, do_lower_case=do_lower_case)
+    return tokenizer.convert_ids_to_tokens(text)
 
   def get_predicted_tokens(self):
     return self.finalized_logit,self.rtmpos
@@ -1295,15 +1289,10 @@ def assert_rank(tensor, expected_rank, name=None):
         "`%d` (shape = %s) is not equal to the expected rank `%s`" %
         (name, scope_name, actual_rank, str(tensor.shape), str(expected_rank)))
 
-MODEL_NAME='/u/scr/mhahn/PMLM/1billion/1billion'
-#MODEL_NAME='/u/scr/mhahn/PMLM/wikitext/wikitext103',
-#MODEL_NAME='/u/scr/mhahn/PMLM/u-PMLM-R/model.ckpt-600000'
-
 
 class BertModelDemo():
   def __init__(self,
-#      model_name='/u/scr/mhahn/PMLM/wikitext/wikitext103',
-      model_name=MODEL_NAME,
+      model_name='/u/scr/mhahn/PMLM/FINETUNED/SST2/model.ckpt-11000',
       #model_name='1billion',
       seed=None,
       nsamples=1,
@@ -1343,34 +1332,6 @@ class BertModelDemo():
     self.sess = tf.Session()
     saver.restore(self.sess, model_name)
     print ("model restoring completed")
-    self.encodedInputCache = {}
-
-  def encodeInputWithMask(self, text_base, withCaching=False):
-      if withCaching and text_base in self.encodedInputCache:
-        return self.encodedInputCache[text_base]
-      context_tokens = [101]
-  #    text_base = "The [MASK] [MASK] [MASK] [MASK] [MASK] is a [MASK] movie ."
-      text_base_list = text_base.split(" ")
-      for word in text_base_list:
-        if word == "[MASK]":
-           single_text = [103]
-        elif word == "[CLS]":
-           single_text = [101]
-        elif word == "[SEP]":
-           single_text = [102]
-        else:
-           single_text = BertModel.encodetext(word, vocab_file = self.vocab_file, do_lower_case = self.do_lower_case)
-#        print("single_text", single_text)
-        context_tokens.extend(single_text)
-      #print(text_base)
-      #print(context_tokens)
-      #quit()
-      context_tokens.extend([102])
-      if withCaching:
-        self.encodedInputCache[text_base] = context_tokens
-      return context_tokens
-  
-
 
   def generate_text(self,raw_text, order = "l2r"):
     """
@@ -1379,10 +1340,18 @@ class BertModelDemo():
     """
     context_tokens = [101]
     text_base = "The [MASK] [MASK] [MASK] [MASK] [MASK] is a [MASK] movie ."
-    context_tokens = self.encodeInputWithMask(text_base)
-    text_length = len(context_tokens)
-    TEXT_LENGTH = text_length
-    context_tokens.extend(([103]*(TEXT_LENGTH-len(context_tokens))))
+    num_texts = len(raw_text)
+    text_base = text_base.split(" ")
+    text_length = len(text_base)
+    for word in text_base:
+      if word == "[MASK]":
+         single_text = [103]
+      else:
+         single_text = BertModel.encodetext(word, vocab_file = self.vocab_file, do_lower_case = self.do_lower_case)
+      print("single_text", single_text)
+      context_tokens.extend(single_text)
+    TEXT_LENGTH = text_length+2
+    context_tokens.extend([102] + ([103]*(TEXT_LENGTH-len(context_tokens))))
 #    context_tokens.extend([103]*100) 
     input_context_tokens = context_tokens[:TEXT_LENGTH]
     order = "l2r"
@@ -1410,137 +1379,11 @@ class BertModelDemo():
          print (final_output.replace(" ##",""))
          print ("\n")
     return 
-
-
-  def  generate_text_from_numeric(self, numeric):
-    numeric_original = [x[::] for x in numeric]
-    TEXT_LENGTH = max(len(x) for x in numeric)
-    assert len(numeric) == BATCH_SIZE
-
-    longestIndex = [i for i in range(len(numeric)) if len(numeric[i]) == TEXT_LENGTH][0]
-    input_mpos_list = []
-    for i in range(TEXT_LENGTH):
-      if numeric[longestIndex][i] == 103:
-        input_mpos_list.append(i)
-
-
-    for i in range(len(numeric)):
-       numeric[i].extend(([103]*(TEXT_LENGTH-len(numeric[i]))))
-    input_context_tokens = numeric
-    order = "l2r"
-
-#    print("input_context_tokens", input_context_tokens[0])
-#    print("input_context_tokens", input_context_tokens[1])
-#    print("input_context_tokens", input_context_tokens[2])
-#    print("input_context_tokens", input_context_tokens[-1])
-#    print ("The order for generation is:")
-#    print (input_mpos_list)
-    for bert_iter in range(1):
-      out_combo = self.sess.run(self.output, feed_dict={
-              self.input_ids: input_context_tokens, 
-              self.mpos_list: input_mpos_list
-              })
-#      print("OUT_COMBO", out_combo)
-      out = out_combo[0][0]
-      mpos = out_combo[1]
-      assert self.batch_size == BATCH_SIZE
-      generated_strings = []
-      for i in range(self.batch_size):
-         out_numeric = out_combo[0][i]
- #        print(len(out_numeric), len(numeric[i]))
-#         print(out_numeric.size)
-         assert out_numeric.size >= len(numeric_original[i])
-         out_numeric = out_numeric[:len(numeric_original[i])]
-         final_output =  (' '.join(BertModel.decodetext(out_numeric,vocab_file=self.vocab_file,do_lower_case = self.do_lower_case)))
- #        print ("The generated text is:", bert_iter, i, self.batch_size)
-         if i == 0:
-            print (final_output.replace(" ##",""))
-   #      print ("\n")
-         generated_strings.append(final_output.replace(" ##",""))
-    return generated_strings
-
-
-
-BATCH_SIZE=16
 if __name__ == '__main__':
-  demo = BertModelDemo(batch_size=BATCH_SIZE, nsamples=BATCH_SIZE)
-#  demo.generate_text(["The","quick","brown","fox","jumps","over","the","lazy","dog"],order= "random") # generate texts containing the tokens in right-to-left order
-
-
-blankCandidates = []
-
-for group in ["", "_d", "_e"]:
- try:
-  with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev_alternatives_c_sentBreak_new_finetuned_large{group}.tsv", "r") as inFile:
-   for line in inFile:
-       if line.startswith("####"):
-          next(inFile)
-          tokenized = next(inFile).strip() # tokenized by the original XLNET tokenizer
-          print("TOK", tokenized)
-          line = next(inFile)
-       if len(line) < 3:
-        continue
-       try:
-          mask, sampled = line.strip().split("\t")
-       except ValueError:
-          continue
-       sampled = sampled.strip().split(" ")
-       mask = mask.strip()
-       assert len(sampled) == len(mask), (sampled, mask)
-       masked = [sampled[i] if mask[i] == "0" else "[MASK]" for i in range(len(mask))]
-       masked = "".join(masked).replace("▁", " ").replace("[MASK]", " [MASK] ").replace("  ", " ").replace("</s>", "").strip()
-       #print(("CANDIDATE", (tokenized, mask, masked)))
-       encodedWithMask = demo.encodeInputWithMask(masked, withCaching=True)
-       maskString = "".join(["0" if x != 103 else "1" for x in encodedWithMask])
-       blankCandidates.append({"tokenized" : tokenized, "XLNET_Mask" : mask, "masked" : masked, "PMLM_Encoded" : encodedWithMask, "PMLM_Mask_Encoded" : maskString})
-       #print(blankCandidates[-1])
-       if len(blankCandidates) % 1000 == 0:
-          #break
-          print("Recording blank candidates", len(blankCandidates))
- except StopIteration:
-    pass
-
-print(len(blankCandidates))
-queue = []
-
-blankCandidates = sorted(blankCandidates, key=lambda x:x["PMLM_Mask_Encoded"])
-
-#{'tokenized': "▁it ▁ ' s ▁a ▁charming ▁and ▁often ▁affecting ▁journey ▁ . </s>", 'XLNET_Mask': '1000000000000', 'masked': "[MASK] 's a charming and often affecting journey .", 'PMLM_Encoded': [101, 103, 112, 188, 170, 14186, 1105, 1510, 12759, 5012, 119, 102], 'PMLM_Mask_Encoded': '010000000000'}
-
-BATCHES = []
-i=0
-while i < len(blankCandidates):
-   if i+1 == len(blankCandidates):
-     j=i
-   else:
-     for j in range(i+1, min(len(blankCandidates), i+BATCH_SIZE+1)):
-        if not (blankCandidates[j]["PMLM_Mask_Encoded"].startswith(blankCandidates[i]["PMLM_Mask_Encoded"])):
-            break
-     j -= 1
-   BATCHES.append(blankCandidates[i:j+1])
-#   print(j-i, i,j, blankCandidates[j]["PMLM_Mask_Encoded"], blankCandidates[i]["PMLM_Mask_Encoded"], (blankCandidates[j]["PMLM_Mask_Encoded"].startswith(blankCandidates[i]["PMLM_Mask_Encoded"])), len(blankCandidates))
-   i = j+1
-print(len(BATCHES))
-print(sum([len(x) for x in BATCHES])/len(BATCHES))
-import random
-random.shuffle(BATCHES)
-count = 0
-with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev_alternatives_PMLM_{MODEL_NAME.split('/')[-2]}_raw.tsv", "w") as outFile:
-  for batch in BATCHES:
-     count += 1
-     if count % 100:
-       print("fraction of all batches", count/len(BATCHES))
-       print(batch[-1])
-       print("MASK", batch[-1]["PMLM_Mask_Encoded"])
-     while len(batch) < BATCH_SIZE:
-       batch = (batch+batch)[:BATCH_SIZE]
-     numeric = [x["PMLM_Encoded"] for x in batch]
-     generated = demo.generate_text_from_numeric(numeric) # generate texts containing the tokens in right-to-left order
-     assert len(generated) == len(batch)
-     for b,g in zip(batch, generated):
-         print(b["XLNET_Mask"], "\t", b["tokenized"], "\t", g.strip(), file=outFile)
-
-
-
-
+  demo = BertModelDemo(batch_size=4, nsamples=4)
+#  for i in range(3):
+#    demo.generate_text([""], order = "l2r") # freely generate texts in left-to-right order
+ #   demo.generate_text(["Tom is a cat and Jerry is a mouse."], order = "l2r") # generate texts given the begining in left-to-right order
+  #  demo.generate_text(["Tom is a cat and Jerry is a mouse.", "Tom and Jerry become good friends in the end."], order = "r2l") # generate texts containing the two strings in right-to-left order
+  demo.generate_text(["The","quick","brown","fox","jumps","over","the","lazy","dog"],order= "random") # generate texts containing the tokens in right-to-left order
 

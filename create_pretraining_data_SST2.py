@@ -1,3 +1,6 @@
+# ~/python-py-jiant create_pretraining_data_SST2.py --input_file PROCESSED_TEXT/SST2_valid.txt --vocab_file en_vocab.txt --output_file PROCESSED_TEXT/SST2_valid.txt.out
+
+
 # coding=utf-8
 # Copyright 2018 The Google AI Language Team Authors.
 #

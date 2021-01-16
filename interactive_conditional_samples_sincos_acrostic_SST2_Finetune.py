@@ -1,41 +1,34 @@
-# coding=utf-8
 
-# 2020/01/01 Changed for PMLM. 
-#   Huawei Technologies Co., Ltd. 
-# Copyright (c) 2020. Huawei Technologies Co., Ltd. All rights reserved.
+#export LD_LIBRARY_PATH=/usr/local/cuda-9.0/lib64:$LD_LIBRARY_PATH
+#export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+#jiant environment
 
-# Copyright 2018 The Google AI Language Team Authors.
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""The main BERT model and related functions."""
+
+#!/usr/bin/env python3
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import random
 import collections
 import copy
 import json
 import math
 import re
-import numpy as np
 import six
+import os
+import numpy as np
 import tensorflow as tf
+import tokenization
+
 
 class BertConfig(object):
   """Configuration for `BertModel`."""
 
   def __init__(self,
                vocab_size,
+               temperature,
                hidden_size=768,
                num_hidden_layers=12,
                num_attention_heads=12,
@@ -45,8 +38,7 @@ class BertConfig(object):
                attention_probs_dropout_prob=0.1,
                max_position_embeddings=512,
                type_vocab_size=16,
-               initializer_range=0.02,
-               use_relative_position=False):
+               initializer_range=0.02):
     """Constructs BertConfig.
 
     Args:
@@ -82,7 +74,7 @@ class BertConfig(object):
     self.max_position_embeddings = max_position_embeddings
     self.type_vocab_size = type_vocab_size
     self.initializer_range = initializer_range
-    self.use_relative_position = use_relative_position
+    self.temperature = temperature
 
   @classmethod
   def from_dict(cls, json_object):
@@ -108,6 +100,8 @@ class BertConfig(object):
     """Serializes this instance to a JSON string."""
     return json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
 
+
+TOKENIZER=None
 
 class BertModel(object):
   """BERT model ("Bidirectional Encoder Representations from Transformers").
@@ -136,11 +130,12 @@ class BertModel(object):
   def __init__(self,
                config,
                is_training,
-               input_ids,
+               init_input_ids,
+               init_mpos_list,
                purt = None,
                input_mask=None,
                token_type_ids=None,
-               use_one_hot_embeddings=False,
+               use_one_hot_embeddings=True,
                scope=None):
     """Constructor for BertModel.
 
@@ -152,33 +147,81 @@ class BertModel(object):
       input_mask: (optional) int32 Tensor of shape [batch_size, seq_length].
       token_type_ids: (optional) int32 Tensor of shape [batch_size, seq_length].
       use_one_hot_embeddings: (optional) bool. Whether to use one-hot word
-        embeddings or tf.embedding_lookup() for the word embeddings.
+        embeddings or tf.embedding_lookup() for the word embeddings. On the TPU,
+        it is much faster if this is True, on the CPU or GPU, it is faster if
+        this is False.
       scope: (optional) variable scope. Defaults to "bert".
 
     Raises:
       ValueError: The config is invalid or one of the input tensor shapes
         is invalid.
     """
+
+
+    def get_output_logits(bert_config, embedding_table,sequence_output):
+      """Get loss and log probs for the masked LM."""
+      input_tensor = sequence_output #[:,start_token_idx,:]
+      """
+      if past == None :
+        input_tensor = sequence_output[:, start_token_idx,:]
+      else:
+        input_tensor = sequence_output[:, 1,:]
+      """
+
+      print("INPUT TENSOR", input_tensor)
+      #if start_token_idx == 52:
+      #else:
+      #input_tensor = sequence_output[:, 1,:]
+
+
+      with tf.variable_scope("cls/predictions",reuse=tf.AUTO_REUSE):
+        # We apply one more non-linear transformation before the output layer.
+        # This matrix is not used after pre-training.
+        with tf.variable_scope("transform",reuse=tf.AUTO_REUSE):
+          input_tensor = tf.layers.dense(
+            input_tensor,
+            units=bert_config.hidden_size,
+            activation=get_activation(bert_config.hidden_act),
+            kernel_initializer=create_initializer(
+              bert_config.initializer_range))
+          print("INPUT TENSOR", input_tensor)
+          input_tensor = layer_norm(input_tensor)
+          print("INPUT TENSOR", input_tensor)
+
+        # The output weights are the same as the input embeddings, but there is
+        # an output-only bias for each token.
+        output_bias = tf.get_variable(
+          "output_bias",
+          shape=[bert_config.vocab_size],
+          initializer=tf.zeros_initializer())
+        print(input_tensor, embedding_table, output_bias)
+        logits = tf.einsum('ijk,lk->ijl', input_tensor, embedding_table)
+        logits = tf.nn.bias_add(logits, output_bias)
+        return logits
+
+
     config = copy.deepcopy(config)
     if not is_training:
       config.hidden_dropout_prob = 0.0
       config.attention_probs_dropout_prob = 0.0
 
-    input_shape = get_shape_list(input_ids, expected_rank=2)
+    input_shape = get_shape_list(init_input_ids, expected_rank=2)
     batch_size = input_shape[0]
-    seq_length = input_shape[1]
+    init_seq_length = input_shape[1]
 
     if input_mask is None:
-      input_mask = tf.ones(shape=[batch_size, seq_length], dtype=tf.int32)
+      input_mask = tf.ones(shape=[batch_size, init_seq_length], dtype=tf.int32)
 
     if token_type_ids is None:
-      token_type_ids = tf.zeros(shape=[batch_size, seq_length], dtype=tf.int32)
+      use_token_type = False
+      token_type_ids = tf.zeros(shape=[batch_size, init_seq_length], dtype=tf.int32)
+
 
     with tf.variable_scope("bert", reuse = tf.AUTO_REUSE):
       with tf.variable_scope("embeddings"):
         # Perform embedding lookup on the word ids.
         (self.embedding_output, self.embedding_table) = embedding_lookup(
-            input_ids=input_ids,
+            input_ids=init_input_ids,
             vocab_size=config.vocab_size,
             embedding_size=config.hidden_size,
             initializer_range=config.initializer_range,
@@ -193,7 +236,7 @@ class BertModel(object):
             token_type_ids=token_type_ids,
             token_type_vocab_size=config.type_vocab_size,
             token_type_embedding_name="token_type_embeddings",
-            use_position_embeddings=True if not config.use_relative_position else False,
+            use_position_embeddings=False, # in accordance with step()
             position_embedding_name="position_embeddings",
             initializer_range=config.initializer_range,
             max_position_embeddings=config.max_position_embeddings,
@@ -206,7 +249,9 @@ class BertModel(object):
         # mask of shape [batch_size, seq_length, seq_length] which is used
         # for the attention scores.
         attention_mask = create_attention_mask_from_input_mask(
-            input_ids, input_mask)
+            init_input_ids, input_mask)
+
+        print("all_encoder_layers, line 319", self.embedding_output)
 
         # Run the stacked transformer.
         # `sequence_output` shape = [batch_size, seq_length, hidden_size].
@@ -222,27 +267,51 @@ class BertModel(object):
             attention_probs_dropout_prob=config.attention_probs_dropout_prob,
             initializer_range=config.initializer_range,
             do_return_all_layers=True,
-            use_relative_position=config.use_relative_position
+#            use_relative_position=config.use_relative_position,
+            start_token_idx = None
             )
 
-      self.sequence_output = tf.cast(self.all_encoder_layers[-1], tf.float32)
+
+      print("all_encoder_layers, line 338", self.all_encoder_layers)
+      self.sequence_output = self.all_encoder_layers[-1]
       # The "pooler" converts the encoded sequence tensor of shape
       # [batch_size, seq_length, hidden_size] to a tensor of shape
-      # [batch_size, hidden_size]. This is necessary for segment-level
-      # (or segment-pair-level) classification tasks where we need a fixed
-      # dimensional representation of the segment.
-      with tf.variable_scope("pooler"):
-        # We "pool" the model by simply taking the hidden state corresponding
-        # to the first token. We assume that this has been pre-trained
-        first_token_tensor = tf.squeeze(self.sequence_output[:, 0:1, :], axis=1)
-        self.pooled_output = tf.layers.dense(
-            first_token_tensor,
-            config.hidden_size,
-            activation=tf.tanh,
-            kernel_initializer=create_initializer(config.initializer_range))
+    self.predicted_logit = get_output_logits(config, self.embedding_table, self.sequence_output)
+
+
+#      print("PREDICTION", self.predicted_logit)
+
+
+
+
+
+    self.rtmpos= init_mpos_list
+
+
+  @classmethod
+  def encodetext(cls, text, vocab_file,do_lower_case):
+    global TOKENIZER
+    if TOKENIZER is None:
+      TOKENIZER = tokenization.FullTokenizer(
+        vocab_file=vocab_file, do_lower_case=do_lower_case)
+    unicode_text = tokenization.convert_to_unicode(text)
+    tokenized = TOKENIZER.tokenize(unicode_text)
+    #bos = ["[CLS]"]
+    #bos.extend(tokenized)
+    return TOKENIZER.convert_tokens_to_ids(tokenized)
+
+  @classmethod
+  def decodetext(cls, text, vocab_file, do_lower_case):
+    global TOKENIZER
+    if TOKENIZER is None:
+      TOKENIZER = tokenization.FullTokenizer(
+        vocab_file=vocab_file, do_lower_case=do_lower_case)
+    return TOKENIZER.convert_ids_to_tokens(text)
 
   def get_pooled_output(self):
     return self.pooled_output
+
+
 
   def get_sequence_output(self):
     """Gets final hidden layer of encoder.
@@ -271,20 +340,21 @@ class BertModel(object):
     return self.embedding_table
 
 
-def gelu(x):
+def gelu(input_tensor):
   """Gaussian Error Linear Unit.
 
   This is a smoother version of the RELU.
   Original paper: https://arxiv.org/abs/1606.08415
+
   Args:
-    x: float Tensor to perform activation.
+    input_tensor: float Tensor to perform activation.
 
   Returns:
-    `x` with the GELU activation applied.
+    `input_tensor` with the GELU activation applied.
   """
-  cdf = 0.5 * (1.0 + tf.tanh(
-      (np.sqrt(2 / np.pi) * (x + 0.044715 * tf.pow(x, 3)))))
-  return x * cdf
+  cdf = 0.5 * (1.0 + tf.tanh(np.sqrt(2 / np.pi) * (input_tensor + 0.044715 * tf.pow(input_tensor, 3))))
+  #cdf = 0.5 * (1.0 + tf.erf(input_tensor / tf.sqrt(2.0)))
+  return input_tensor * cdf
 
 
 def get_activation(activation_string):
@@ -370,137 +440,9 @@ def dropout(input_tensor, dropout_prob):
   return output
 
 
-# see https://github.com/tensorflow/tensorflow/pull/24979
-from tensorflow.contrib.framework.python.ops import add_arg_scope
-@add_arg_scope
-def contrib_layer_norm(inputs,
-               center=True,
-               scale=True,
-               activation_fn=None,
-               reuse=None,
-               variables_collections=None,
-               outputs_collections=None,
-               trainable=True,
-               begin_norm_axis=1,
-               begin_params_axis=-1,
-               scope=None):
-  """Adds a Layer Normalization layer.
-  Based on the paper:
-    "Layer Normalization"
-    Jimmy Lei Ba, Jamie Ryan Kiros, Geoffrey E. Hinton
-    https://arxiv.org/abs/1607.06450.
-  Can be used as a normalizer function for conv2d and fully_connected.
-  Given a tensor `inputs` of rank `R`, moments are calculated and normalization
-  is performed over axes `begin_norm_axis ... R - 1`.  Scaling and centering,
-  if requested, is performed over axes `begin_params_axis .. R - 1`.
-  By default, `begin_norm_axis = 1` and `begin_params_axis = -1`,
-  meaning that normalization is performed over all but the first axis
-  (the `HWC` if `inputs` is `NHWC`), while the `beta` and `gamma` trainable
-  parameters are calculated for the rightmost axis (the `C` if `inputs` is
-  `NHWC`).  Scaling and recentering is performed via broadcast of the
-  `beta` and `gamma` parameters with the normalized tensor.
-  The shapes of `beta` and `gamma` are `inputs.shape[begin_params_axis:]`,
-  and this part of the inputs' shape must be fully defined.
-  Args:
-    inputs: A tensor having rank `R`. The normalization is performed over
-      axes `begin_norm_axis ... R - 1` and centering and scaling parameters
-      are calculated over `begin_params_axis ... R - 1`.
-    center: If True, add offset of `beta` to normalized tensor. If False, `beta`
-      is ignored.
-    scale: If True, multiply by `gamma`. If False, `gamma` is
-      not used. When the next layer is linear (also e.g. `nn.relu`), this can be
-      disabled since the scaling can be done by the next layer.
-    activation_fn: Activation function, default set to None to skip it and
-      maintain a linear activation.
-    reuse: Whether or not the layer and its variables should be reused. To be
-      able to reuse the layer scope must be given.
-    variables_collections: Optional collections for the variables.
-    outputs_collections: Collections to add the outputs.
-    trainable: If `True` also add variables to the graph collection
-      `GraphKeys.TRAINABLE_VARIABLES` (see tf.Variable).
-    begin_norm_axis: The first normalization dimension: normalization will be
-      performed along dimensions `begin_norm_axis : rank(inputs)`
-    begin_params_axis: The first parameter (beta, gamma) dimension: scale
-      and centering parameters will have dimensions
-      `begin_params_axis : rank(inputs)` and will be broadcast with the
-      normalized inputs accordingly.
-    scope: Optional scope for `variable_scope`.
-  Returns:
-    A `Tensor` representing the output of the operation, having the same
-    shape and dtype as `inputs`.
-  Raises:
-    ValueError: If the rank of `inputs` is not known at graph build time,
-      or if `inputs.shape[begin_params_axis:]` is not fully defined at
-      graph build time.
-  """
-  from tensorflow.contrib.framework.python.ops import variables
-  from tensorflow.contrib.layers.python.layers import utils
-  from tensorflow.python.framework import ops
-  from tensorflow.python.ops import init_ops
-  from tensorflow.python.ops import nn
-  from tensorflow.python.ops import variable_scope
-  with variable_scope.variable_scope(
-      scope, 'LayerNorm', [inputs], reuse=reuse) as sc:
-    inputs = ops.convert_to_tensor(inputs)
-    inputs_shape = inputs.shape
-    inputs_rank = inputs_shape.ndims
-    if inputs_rank is None:
-      raise ValueError('Inputs %s has undefined rank.' % inputs.name)
-    dtype = inputs.dtype.base_dtype
-    if begin_norm_axis < 0:
-      begin_norm_axis = inputs_rank + begin_norm_axis
-    if begin_params_axis >= inputs_rank or begin_norm_axis >= inputs_rank:
-      raise ValueError('begin_params_axis (%d) and begin_norm_axis (%d) '
-                       'must be < rank(inputs) (%d)' %
-                       (begin_params_axis, begin_norm_axis, inputs_rank))
-    params_shape = inputs_shape[begin_params_axis:]
-    if not params_shape.is_fully_defined():
-      raise ValueError(
-          'Inputs %s: shape(inputs)[%s:] is not fully defined: %s' %
-          (inputs.name, begin_params_axis, inputs_shape))
-    # Allocate parameters for the beta and gamma of the normalization.
-    beta, gamma = None, None
-    if center:
-      beta_collections = utils.get_variable_collections(variables_collections,
-                                                        'beta')
-      beta = variables.model_variable(
-          'beta',
-          shape=params_shape,
-          dtype=dtype,
-          initializer=init_ops.zeros_initializer(),
-          collections=beta_collections,
-          trainable=trainable)
-    if scale:
-      gamma_collections = utils.get_variable_collections(
-          variables_collections, 'gamma')
-      gamma = variables.model_variable(
-          'gamma',
-          shape=params_shape,
-          dtype=dtype,
-          initializer=init_ops.ones_initializer(),
-          collections=gamma_collections,
-          trainable=trainable)
-    # Calculate the moments on the last axis (layer activations).
-    norm_axes = list(range(begin_norm_axis, inputs_rank))
-    mean, variance = nn.moments(inputs, norm_axes, keep_dims=True)
-    # Compute layer normalization using the batch_normalization function.
-    variance_epsilon = 1e-12
-    outputs = nn.batch_normalization(
-        inputs,
-        mean,
-        variance,
-        offset=beta,
-        scale=gamma,
-        variance_epsilon=variance_epsilon)
-    outputs.set_shape(inputs_shape)
-    if activation_fn is not None:
-      outputs = activation_fn(outputs)
-    return utils.collect_named_outputs(outputs_collections, sc.name, outputs)
-
-
 def layer_norm(input_tensor, name=None):
   """Run layer normalization on the last dimension of the tensor."""
-  return contrib_layer_norm(
+  return tf.contrib.layers.layer_norm(
       inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name)
 
 
@@ -532,7 +474,8 @@ def embedding_lookup(input_ids,
     initializer_range: float. Embedding initialization range.
     word_embedding_name: string. Name of the embedding table.
     use_one_hot_embeddings: bool. If True, use one-hot method for word
-      embeddings. If False, use `tf.gather()`.
+      embeddings. If False, use `tf.nn.embedding_lookup()`. One hot is better
+      for TPUs.
 
   Returns:
     float Tensor of shape [batch_size, seq_length, embedding_size].
@@ -550,12 +493,12 @@ def embedding_lookup(input_ids,
       shape=[vocab_size, embedding_size],
       initializer=create_initializer(initializer_range))
 
-  flat_input_ids = tf.reshape(input_ids, [-1])
   if use_one_hot_embeddings:
+    flat_input_ids = tf.reshape(input_ids, [-1])
     one_hot_input_ids = tf.one_hot(flat_input_ids, depth=vocab_size)
     output = tf.matmul(one_hot_input_ids, embedding_table)
   else:
-    output = tf.gather(embedding_table, flat_input_ids)
+    output = tf.nn.embedding_lookup(embedding_table, input_ids)
 
   input_shape = get_shape_list(input_ids)
 
@@ -573,7 +516,9 @@ def embedding_postprocessor(input_tensor,
                             position_embedding_name="position_embeddings",
                             initializer_range=0.02,
                             max_position_embeddings=512,
-                            dropout_prob=0.1):
+                            dropout_prob=0.1,
+                            start_token_idx = 0
+                            ):
   """Performs various post-processing on a word embedding tensor.
 
   Args:
@@ -625,7 +570,6 @@ def embedding_postprocessor(input_tensor,
                                        [batch_size, seq_length, width])
     output += token_type_embeddings
 
-
   if use_position_embeddings:
     assert_op = tf.assert_less_equal(seq_length, max_position_embeddings)
     with tf.control_dependencies([assert_op]):
@@ -660,8 +604,17 @@ def embedding_postprocessor(input_tensor,
   output = layer_norm_and_dropout(output, dropout_prob)
   return output
 
+def create_attention_mask_for_gpt(from_tensor):
+  # create a mask for gpt : 1's in the lower triangle, counting from the lower right corner--by liaoyi
+  from_shape = get_shape_list(from_tensor, expected_rank=[2, 3])
+  batch_size = from_shape[0]
+  from_seq_length = from_shape[1]
+  mask =  tf.matrix_band_part(tf.ones([from_seq_length, from_seq_length]), -1, from_seq_length-from_seq_length)
+  cast_mask = tf.cast(mask, tf.float32)
+  return tf.broadcast_to(cast_mask,[batch_size,from_seq_length,from_seq_length])
 
-def create_attention_mask_from_input_mask(from_tensor, to_mask):
+
+def create_attention_mask_from_input_mask(from_tensor, to_mask, start_token_idx= None):
   """Create 3D attention mask from a 2D tensor mask.
 
   Args:
@@ -676,10 +629,13 @@ def create_attention_mask_from_input_mask(from_tensor, to_mask):
   from_seq_length = from_shape[1]
 
   to_shape = get_shape_list(to_mask, expected_rank=2)
-  to_seq_length = to_shape[1]
-
+  to_seq_length = to_shape[1] 
   to_mask = tf.cast(
       tf.reshape(to_mask, [batch_size, 1, to_seq_length]), tf.float32)
+
+  if start_token_idx != None:
+      to_mask = tf.ones([batch_size,1,to_seq_length],tf.float32)
+
 
   # We don't assume that `from_tensor` is a mask (although it could be). We
   # don't actually care if we attend *from* padding tokens (only *to* padding)
@@ -687,112 +643,12 @@ def create_attention_mask_from_input_mask(from_tensor, to_mask):
   #
   # `broadcast_ones` = [batch_size, from_seq_length, 1]
   broadcast_ones = tf.ones(
-      shape=[batch_size, from_seq_length, 1], dtype=tf.float32)
+      shape=[batch_size, to_seq_length, 1], dtype=tf.float32)
 
   # Here we broadcast along two dimensions to create the mask.
   mask = broadcast_ones * to_mask
-
   return mask
 
-
-def _generate_relative_positions_matrix(length, max_relative_position,
-                                        cache=False):
-  """Generates matrix of relative positions between inputs."""
-  if not cache:
-    range_vec = tf.range(length)
-    range_mat = tf.reshape(tf.tile(range_vec, [length]), [length, length])
-    distance_mat = range_mat - tf.transpose(range_mat)
-  else:
-    distance_mat = tf.expand_dims(tf.range(-length+1, 1, 1), 0)
-  distance_mat_clipped = tf.clip_by_value(distance_mat, -max_relative_position,
-                                          max_relative_position)
-  # Shift values to be >= 0. Each integer still uniquely identifies a relative
-  # position difference.
-  final_mat = distance_mat_clipped + max_relative_position
-  return final_mat
-
-
-def _generate_relative_positions_embeddings(length, depth,
-                                            max_relative_position, name, 
-                                            cache=False):
-  """
-  Generates tensor of size [1 if cache else length, length, depth].
-  example:
-      # `relation_keys` = [F|T, F|T, H]
-
-         relations_keys = _generate_relative_positions_embeddings(
-      to_seq_length, size_per_head, max_relative_position, "relative_positions_keys",
-      cache=False)
-    relations_keys = tf.saturate_cast(relations_keys, compute_type)
-
-  # Scalar dimensions referenced here:
-  #   B = batch size (number of sequences)
-  #   F = `from_tensor` sequence length
-  #   T = `to_tensor` sequence length
-  #   N = `num_attention_heads`
-  #   H = `size_per_head`
-
-    length = to_seq_length
-    depth = size_per_head
-    max_relative_position
-    name = "relative_positions_keys"
-  """
- # '''
-  #with tf.variable_scope(name):
-  relative_positions_matrix = _generate_relative_positions_matrix(
-        length, max_relative_position, cache=cache)
-  vocab_size = max_relative_position * 2 + 1
-    # Generates embedding for each relative position of dimension depth.
-  embeddings_table = np.zeros([vocab_size, depth]) #range(vocab_size * depth)#tf.get_variable(name="embeddings", shape=[vocab_size, depth], initializer=create_initializer())
- # embeddings_table.reshape((-1, depth))
-
-  #  pe = torch.zeros(max_len, d_model)
-  position = tf.range(0.0, vocab_size, 1.0)#.unsqueeze(1)
-  position = tf.reshape(position, [vocab_size, -1])
-
- # div_term = tf.math.exp(tf.range(0.0, depth, 2.0) *
- #                            (-(tf.math.log(10000.0) / depth)))
-  
-  #div_term = tf.reshape(div_term, [depth, -1])
-
-  for pos in range(vocab_size):
-    for i in range(depth // 2):
-      embeddings_table[pos, 2 * i] = np.sin(pos / np.power(10000, 2 * i / depth))
-      embeddings_table[pos, 2 * i + 1] = np.cos(pos / np.power(10000, 2 * i / depth))
-
- # embeddings_table[:, 0::2] = tf.sin(position * div_term)
- # embeddings_table[:, 1::2] = tf.cos(position * div_term)
- #   #pe = pe.unsqueeze(0)
-  
-  embeddings_table_tensor = tf.convert_to_tensor(embeddings_table, tf.float32)
-  flat_relative_positions_matrix = tf.reshape(relative_positions_matrix, [-1])
-    # [length * length?, vocab_size]
-  one_hot_relative_positions_matrix = tf.one_hot(flat_relative_positions_matrix, depth=vocab_size)
-
-  embeddings = tf.matmul(one_hot_relative_positions_matrix, embeddings_table_tensor)
-
-  my_shape = relative_positions_matrix.shape.as_list()
-  my_shape.append(depth)
-
-  embeddings = tf.reshape(embeddings, my_shape)
-  return embeddings
-  '''
-  relative_positions_matrix = _generate_relative_positions_matrix( 
-        length, max_relative_position, cache=cache)
-  vocab_size = max_relative_position * 2 + 1
-    # Generates embedding for each relative position of dimension depth.
-
-  embeddings_table = tf.get_variable(name="embeddings", shape=[vocab_size, depth], initializer=create_initializer())
-
-  flat_relative_positions_matrix = tf.reshape(relative_positions_matrix, [-1])
-  one_hot_relative_positions_matrix = tf.one_hot(flat_relative_positions_matrix, depth=vocab_size)
-  embeddings = tf.matmul(one_hot_relative_positions_matrix, embeddings_table)
-  my_shape = relative_positions_matrix.shape.as_list()
-  my_shape.append(depth)
-  embeddings = tf.reshape(embeddings, my_shape)
-  
-  return embeddings
-  '''
 
 def attention_layer(from_tensor,
                     to_tensor,
@@ -808,7 +664,9 @@ def attention_layer(from_tensor,
                     batch_size=None,
                     from_seq_length=None,
                     to_seq_length=None,
-                    use_relative_position=False
+                    past = None,
+                    start_token_idx = None
+
                     ):
   """Performs multi-headed attention from `from_tensor` to `to_tensor`.
 
@@ -932,21 +790,25 @@ def attention_layer(from_tensor,
                                      num_attention_heads, from_seq_length,
                                      size_per_head)
 
+
   # `key_layer` = [B, N, T, H]
   key_layer = transpose_for_scores(key_layer, batch_size, num_attention_heads,
                                    to_seq_length, size_per_head)
-
   # Take the dot product between "query" and "key" to get the raw
   # attention scores.
   # `attention_scores` = [B, N, F, T]
   attention_scores = tf.matmul(query_layer, key_layer, transpose_b=True)
+
+  use_relative_position = True
+
   if use_relative_position:
     assert from_seq_length == to_seq_length
     max_relative_position = 127
     # `relation_keys` = [F|T, F|T, H]
     relations_keys = _generate_relative_positions_embeddings(
-      to_seq_length, size_per_head, max_relative_position, "relative_positions_keys",
-      cache=False)
+                    to_seq_length, size_per_head, max_relative_position, "relative_positions_keys",
+                    cache=False)
+    #relations_keys = tf.saturate_cast(relations_keys, compute_type)
     # query_layer_t is [F, B, N, H]
     query_layer_t = tf.transpose(query_layer, [2, 0, 1, 3])
     # query_layer_r is [F, B * N, H]
@@ -958,18 +820,21 @@ def attention_layer(from_tensor,
     # key_position_scores_r_t is [B, N, F, F|T]
     key_position_scores_r_t = tf.transpose(key_position_scores_r, [1, 2, 0, 3])
     attention_scores = attention_scores + key_position_scores_r_t
-
-    attention_scores = tf.multiply(attention_scores,
-                                  1.0 / math.sqrt(float(size_per_head)))
+  attention_scores = tf.multiply(attention_scores,
+                                 1.0 / math.sqrt(float(size_per_head)))
 
   if attention_mask is not None:
     # `attention_mask` = [B, 1, F, T]
     attention_mask = tf.expand_dims(attention_mask, axis=[1])
+    
+    if start_token_idx is not None:
+       attention_mask = attention_mask[:,:,start_token_idx-1:start_token_idx+1,:]
+    #attention_mask = attention_mask[:,:,:,:]
 
     # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
     # masked positions, this operation will create a tensor which is 0.0 for
     # positions we want to attend and -10000.0 for masked positions.
-    adder = (1.0 - tf.cast(attention_mask, attention_scores.dtype)) * -10000.0
+    adder = (1.0 - tf.cast(attention_mask, tf.float32)) * -10000.0
 
     # Since we are adding it to the raw scores before the softmax, this is
     # effectively the same as removing these entirely.
@@ -991,14 +856,23 @@ def attention_layer(from_tensor,
   # `value_layer` = [B, N, T, H]
   value_layer = tf.transpose(value_layer, [0, 2, 1, 3])
 
+  """
+  if past != None:
+    past_value_layer = past[1]
+    left_value_layer = tf.concat([past_value_layer[:,:,:start_token_idx-1,:], value_layer],axis = 2)
+    value_layer = tf.concat([left_value_layer, past_value_layer[:,:,start_token_idx+1:,:]], axis =2)
+  """
+
   # `context_layer` = [B, N, F, H]
   context_layer = tf.matmul(attention_probs, value_layer)
 
+  # `context_layer` = [B, F, N, H]
   if use_relative_position:
     # `relation_values` = [F|T, F|T, H]
     relations_values = _generate_relative_positions_embeddings(
-      to_seq_length, size_per_head, max_relative_position, "relative_positions_values", 
-      cache=False)
+                    to_seq_length, size_per_head, max_relative_position, "relative_positions_values",
+                    cache=False)
+    #relations_values = tf.saturate_cast(relations_values, compute_type)
     # attention_probs_t is [F, B, N, T]
     attention_probs_t = tf.transpose(attention_probs, [2, 0, 1, 3])
     # attention_probs_r is [F, B * N, T]
@@ -1011,9 +885,8 @@ def attention_layer(from_tensor,
     value_position_scores_r_t = tf.transpose(value_position_scores_r, [1, 2, 0, 3])
     # attention_scores = attention_scores + value_position_scores_r_t
     context_layer = context_layer + value_position_scores_r_t
-
-  # `context_layer` = [B, F, N, H]
   context_layer = tf.transpose(context_layer, [0, 2, 1, 3])
+
 
   if do_return_2d_tensor:
     # `context_layer` = [B*F, N*H]
@@ -1026,8 +899,92 @@ def attention_layer(from_tensor,
         context_layer,
         [batch_size, from_seq_length, num_attention_heads * size_per_head])
 
-  return context_layer
+  past_layer = tf.stack([key_layer,value_layer],axis=0)
+  return context_layer, past_layer
 
+def _generate_relative_positions_matrix(length, max_relative_position,
+                                        cache=False):
+  """Generates matrix of relative positions between inputs."""
+  if not cache:
+    range_vec = tf.range(length)
+    range_mat = tf.reshape(tf.tile(range_vec, [length]), [length, length])
+    distance_mat = range_mat - tf.transpose(range_mat)
+  else:
+    distance_mat = tf.expand_dims(tf.range(-length+1, 1, 1), 0)
+  distance_mat_clipped = tf.clip_by_value(distance_mat, -max_relative_position,
+                                          max_relative_position)
+  # Shift values to be >= 0. Each integer still uniquely identifies a relative
+  # position difference.
+  final_mat = distance_mat_clipped + max_relative_position
+  return final_mat
+
+
+def _generate_relative_positions_embeddings(length, depth,
+                                            max_relative_position, name, 
+                                            cache=False):
+  """
+  Generates tensor of size [1 if cache else length, length, depth].
+  example:
+      # `relation_keys` = [F|T, F|T, H]
+
+         relations_keys = _generate_relative_positions_embeddings(
+      to_seq_length, size_per_head, max_relative_position, "relative_positions_keys",
+      cache=False)
+    relations_keys = tf.saturate_cast(relations_keys, compute_type)
+
+  # Scalar dimensions referenced here:
+  #   B = batch size (number of sequences)
+  #   F = `from_tensor` sequence length
+  #   T = `to_tensor` sequence length
+  #   N = `num_attention_heads`
+  #   H = `size_per_head`
+
+    length = to_seq_length
+    depth = size_per_head
+    max_relative_position
+    name = "relative_positions_keys"
+  """
+ # '''
+  #with tf.variable_scope(name):
+  relative_positions_matrix = _generate_relative_positions_matrix(
+        length, max_relative_position, cache=cache)
+  vocab_size = max_relative_position * 2 + 1
+    # Generates embedding for each relative position of dimension depth.
+  embeddings_table = np.zeros([vocab_size, depth]) #range(vocab_size * depth)#tf.get_variable(name="embeddings", shape=[vocab_size, depth], initializer=create_initializer())
+ # embeddings_table.reshape((-1, depth))
+
+  #  pe = torch.zeros(max_len, d_model)
+  position = tf.range(0.0, vocab_size, 1.0)#.unsqueeze(1)
+  position = tf.reshape(position, [vocab_size, -1])
+
+ # div_term = tf.math.exp(tf.range(0.0, depth, 2.0) *
+ #                            (-(tf.math.log(10000.0) / depth)))
+  
+  #div_term = tf.reshape(div_term, [depth, -1])
+
+  for pos in range(vocab_size):
+    for i in range(depth // 2):
+      embeddings_table[pos, 2 * i] = np.sin(pos / np.power(10000, 2 * i / depth))
+      embeddings_table[pos, 2 * i + 1] = np.cos(pos / np.power(10000, 2 * i / depth))
+
+ # embeddings_table[:, 0::2] = tf.sin(position * div_term)
+ # embeddings_table[:, 1::2] = tf.cos(position * div_term)
+ #   #pe = pe.unsqueeze(0)
+  
+  embeddings_table_tensor = tf.convert_to_tensor(embeddings_table, tf.float32)
+  flat_relative_positions_matrix = tf.reshape(relative_positions_matrix, [-1])
+    # [length * length?, vocab_size]
+  one_hot_relative_positions_matrix = tf.one_hot(flat_relative_positions_matrix, depth=vocab_size)
+
+  embeddings = tf.matmul(one_hot_relative_positions_matrix, embeddings_table_tensor)
+
+  #my_shape = relative_positions_matrix.shape.as_list()
+  my_shape = tf.shape(relative_positions_matrix)
+  my_shape = tf.concat([my_shape, [depth]], axis = 0)
+  #my_shape.append(depth)
+
+  embeddings = tf.reshape(embeddings, my_shape)
+  return embeddings
 
 def transformer_model(input_tensor,
                       attention_mask=None,
@@ -1040,7 +997,9 @@ def transformer_model(input_tensor,
                       attention_probs_dropout_prob=0.1,
                       initializer_range=0.02,
                       do_return_all_layers=False,
-                      use_relative_position=False):
+                      past = None,
+                      start_token_idx = None
+                      ):
   """Multi-headed, multi-layer Transformer from "Attention is All You Need".
 
   This is almost an exact implementation of the original Transformer encoder.
@@ -1078,17 +1037,19 @@ def transformer_model(input_tensor,
   Raises:
     ValueError: A Tensor shape or parameter is invalid.
   """
+
+
   if hidden_size % num_attention_heads != 0:
     raise ValueError(
         "The hidden size (%d) is not a multiple of the number of attention "
         "heads (%d)" % (hidden_size, num_attention_heads))
-  tf.logging.info('use_relative_position: %s' % use_relative_position)
 
   attention_head_size = int(hidden_size / num_attention_heads)
   input_shape = get_shape_list(input_tensor, expected_rank=3)
   batch_size = input_shape[0]
   seq_length = input_shape[1]
   input_width = input_shape[2]
+
 
   # The Transformer performs sum residuals on all layers so the input needs
   # to be the same as the hidden size.
@@ -1103,14 +1064,18 @@ def transformer_model(input_tensor,
   prev_output = reshape_to_matrix(input_tensor)
 
   all_layer_outputs = []
+  past_layers = []
   for layer_idx in range(num_hidden_layers):
     with tf.variable_scope("layer_%d" % layer_idx):
       layer_input = prev_output
-
+      if past == None:
+        current_past = None
+      else:
+        current_past = past[layer_idx]
       with tf.variable_scope("attention"):
         attention_heads = []
         with tf.variable_scope("self"):
-          attention_head = attention_layer(
+          attention_head, past_layer = attention_layer(
               from_tensor=layer_input,
               to_tensor=layer_input,
               attention_mask=attention_mask,
@@ -1122,8 +1087,11 @@ def transformer_model(input_tensor,
               batch_size=batch_size,
               from_seq_length=seq_length,
               to_seq_length=seq_length,
-              use_relative_position=use_relative_position)
+              past = None,
+              start_token_idx = start_token_idx
+          )
           attention_heads.append(attention_head)
+          past_layers.append(past_layer)
 
         attention_output = None
         if len(attention_heads) == 1:
@@ -1143,7 +1111,7 @@ def transformer_model(input_tensor,
           attention_output = dropout(attention_output, hidden_dropout_prob)
           attention_output = layer_norm(attention_output + layer_input)
 
-      # The activation is only applied to the "intermediate" hidden layer.      
+      # The activation is only applied to the "intermediate" hidden layer.
       with tf.variable_scope("intermediate"):
         intermediate_output = tf.layers.dense(
             attention_output,
@@ -1265,3 +1233,491 @@ def assert_rank(tensor, expected_rank, name=None):
         "For the tensor `%s` in scope `%s`, the actual rank "
         "`%d` (shape = %s) is not equal to the expected rank `%s`" %
         (name, scope_name, actual_rank, str(tensor.shape), str(expected_rank)))
+
+
+
+class BertModelDemo():
+  def __init__(self,
+      model_name='/u/scr/mhahn/PMLM/wikitext/wikitext103',
+      #model_name='1billion',
+      seed=None,
+      nsamples=1,
+      batch_size=1,
+      vocab_file = "en_vocab.txt",
+      do_lower_case = False,
+      length=None,
+      temperature=1,
+      top_k=0,
+  ):
+    self.model_name = model_name
+    self.nsamples = nsamples
+    self.batch_size = batch_size
+    self.vocab_file = vocab_file
+    self.do_lower_case = do_lower_case
+    self.length = length
+    self.temperature = temperature
+
+    if batch_size is None:
+      batch_size = 1
+    assert nsamples % batch_size == 0
+    self.bert_config = BertConfig(vocab_size=28996,temperature = temperature)
+  
+  
+  
+    self.input_ids = tf.placeholder(tf.int32, [batch_size, None])
+    self.mpos_list = tf.placeholder(tf.int32, [None])
+  
+    print ("start build graph")
+    self.model = BertModel(config=self.bert_config, is_training=False, init_input_ids=self.input_ids, init_mpos_list = self.mpos_list)
+    np.random.seed(seed)
+    tf.set_random_seed(seed)
+    print ("finish build graph")
+    self.output = self.model.predicted_logit
+    saver = tf.train.Saver()
+    print ("start restoring para")
+    self.sess = tf.Session()
+    saver.restore(self.sess, model_name)
+    print ("model restoring completed")
+    self.encodedInputCache = {}
+
+  def encodeInputWithMask(self, text_base, withCaching=False):
+      if withCaching and text_base in self.encodedInputCache:
+        return self.encodedInputCache[text_base]
+      context_tokens = [101]
+  #    text_base = "The [MASK] [MASK] [MASK] [MASK] [MASK] is a [MASK] movie ."
+      text_base_list = text_base.split(" ")
+      for word in text_base_list:
+        if word == "[MASK]":
+           single_text = [103]
+        else:
+           single_text = BertModel.encodetext(word, vocab_file = self.vocab_file, do_lower_case = self.do_lower_case)
+#        print("single_text", single_text)
+        context_tokens.extend(single_text)
+      #print(text_base)
+      #print(context_tokens)
+      #quit()
+      context_tokens.extend([102])
+      if withCaching:
+        self.encodedInputCache[text_base] = context_tokens
+      return context_tokens
+  
+
+
+  def generate_text(self,raw_text, order = "l2r"):
+    """
+    raw_text: A list of strings. The strings will distributed across the generated 128 length text.
+    order: The order to generate sentences l2r refers to left to right. r2l refers to right to left. random refers to random order.
+    """
+    context_tokens = [101]
+    text_base = "The [MASK] [MASK] [MASK] [MASK] [MASK] is a [MASK] movie ."
+    context_tokens = self.encodeInputWithMask(text_base)
+    text_length = len(context_tokens)
+    TEXT_LENGTH = text_length
+    context_tokens.extend(([103]*(TEXT_LENGTH-len(context_tokens))))
+#    context_tokens.extend([103]*100) 
+    input_context_tokens = context_tokens[:TEXT_LENGTH]
+    order = "l2r"
+
+    print("input_context_tokens", input_context_tokens)
+    input_mpos_list = []
+    for i in range(TEXT_LENGTH):
+      if input_context_tokens[i] == 103:
+        input_mpos_list.append(i)
+
+    print ("The order for generation is:")
+    print (input_mpos_list)
+    for bert_iter in range(1):
+      out_combo = self.sess.run(self.output, feed_dict={
+              self.input_ids: [input_context_tokens for _ in range(self.batch_size)], 
+              self.mpos_list: input_mpos_list
+              })
+      print("OUT_COMBO", out_combo)
+      out = out_combo[0][0]
+      mpos = out_combo[1]
+      for i in range(self.batch_size):
+         final_output =  (' '.join(BertModel.decodetext(out_combo[0][i],vocab_file=self.vocab_file,do_lower_case = self.do_lower_case)))
+         #context_input =  (' '.join(BertModel.decodetext(input_context_tokens,vocab_file=self.vocab_file,do_lower_case = self.do_lower_case)))
+         print ("The generated text is:", bert_iter, i, self.batch_size)
+         print (final_output.replace(" ##",""))
+         print ("\n")
+    return 
+
+
+  def  training_step(self, numeric):
+    numeric = [self.encodeInputWithMask(x) for x in numeric]
+
+    numeric_original = [x[::] for x in numeric]
+    TEXT_LENGTH = max(len(x) for x in numeric)
+    assert len(numeric) == BATCH_SIZE
+
+    longestIndex = [i for i in range(len(numeric)) if len(numeric[i]) == TEXT_LENGTH][0]
+    input_mpos_list = []
+    for i in range(TEXT_LENGTH):
+      if numeric[longestIndex][i] == 103:
+        input_mpos_list.append(i)
+
+
+    for i in range(len(numeric)):
+       numeric[i].extend(([103]*(TEXT_LENGTH-len(numeric[i]))))
+    input_context_tokens = numeric
+    order = "l2r"
+
+#    print("input_context_tokens", input_context_tokens[0])
+#    print("input_context_tokens", input_context_tokens[1])
+#    print("input_context_tokens", input_context_tokens[2])
+#    print("input_context_tokens", input_context_tokens[-1])
+#    print ("The order for generation is:")
+#    print (input_mpos_list)
+    for bert_iter in range(1):
+      out_combo = self.sess.run(self.output, feed_dict={
+              self.input_ids: input_context_tokens, 
+              self.mpos_list: input_mpos_list
+              })
+#      print("OUT_COMBO", out_combo)
+      out = out_combo[0][0]
+      mpos = out_combo[1]
+      assert self.batch_size == BATCH_SIZE
+      generated_strings = []
+      for i in range(self.batch_size):
+         out_numeric = out_combo[0][i]
+ #        print(len(out_numeric), len(numeric[i]))
+#         print(out_numeric.size)
+         assert out_numeric.size >= len(numeric_original[i])
+         out_numeric = out_numeric[:len(numeric_original[i])]
+         final_output =  (' '.join(BertModel.decodetext(out_numeric,vocab_file=self.vocab_file,do_lower_case = self.do_lower_case)))
+ #        print ("The generated text is:", bert_iter, i, self.batch_size)
+         if i == 0:
+            print (final_output.replace(" ##",""))
+   #      print ("\n")
+         generated_strings.append(final_output.replace(" ##",""))
+    return generated_strings
+
+
+
+BATCH_SIZE=32
+if __name__ == '__main__':
+  demo = BertModelDemo(batch_size=BATCH_SIZE, nsamples=BATCH_SIZE)
+  demo.generate_text(["The","quick","brown","fox","jumps","over","the","lazy","dog"],order= "random") # generate texts containing the tokens in right-to-left order
+  demo.training_step(["This is a [MASK] piece of [MASK] ." for _ in range(BATCH_SIZE)]) # generate texts containing the tokens in right-to-left order
+
+
+#import dataloader
+
+assert args.dataset == "SST2"
+
+sentences = []
+with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev.tsv", "r") as inFile:
+  header = next(inFile) # for the header
+  assert header == "sentence\tlabel\n"
+  for line in inFile:
+     line = line.strip().split("\t")
+     if len(line) < 2:
+       continue
+     assert len(line) == 2
+     sentences.append(line[0])
+
+
+from transformers import AutoTokenizer, AutoModelWithLMHead
+
+tokenizer = AutoTokenizer.from_pretrained("roberta-large")
+
+model = AutoModelWithLMHead.from_pretrained("roberta-large").cuda()
+			
+from transformers import pipeline
+
+#unmasker = pipeline('fill-mask', model='bert-base-uncased')
+
+#print(unmasker("hello i'm a <mask> model."))
+assert tokenizer.mask_token == "<mask>"
+
+sequences = []
+sequences.append(f"Distilled {tokenizer.mask_token} are smaller than the models they mimic. Using them instead of the large versions would help lower our carbon footprint.")
+sequences.append(f"This is a massive blockbuster crunchalic {tokenizer.mask_token} movie.")
+
+inputs = [tokenizer.encode(x, return_tensors="pt")[0] for x in sequences]
+maxLength = max([x.size()[0] for x in inputs])
+for i in range(len(inputs)):
+    inputs[i] = torch.cat([inputs[i], torch.LongTensor([tokenizer.convert_tokens_to_ids("<pad>") for _ in range(maxLength - inputs[i].size()[0])])])
+    print([tokenizer.convert_ids_to_tokens(int(x)) for x in inputs[i]])
+
+
+
+
+input = torch.stack(inputs, dim=0)
+token_logits = model(input.cuda())
+print(token_logits)
+token_logits = token_logits[0]
+print(token_logits)
+print(token_logits.size())
+
+import torch
+print(torch.cuda.is_available())
+
+mask_token_index = (input == tokenizer.mask_token_id)
+print(mask_token_index)
+print([[bool(y) for y in x] for x in mask_token_index])
+print([True in [bool(y) for y in x] for x in mask_token_index])
+
+
+def trueIndex(x):
+   print(x)
+   print(True in x)
+   return (x.index(True))
+mask_token_index = [trueIndex([bool(y) for y in x]) for x in mask_token_index]
+print(mask_token_index)
+
+mask_token_logits = token_logits[0, mask_token_index[0], :]
+mask_token_logits = torch.stack([token_logits[i, mask_token_index[i], :] for i in range(len(mask_token_index))], dim=0)
+print(mask_token_logits)
+
+
+import torch.nn.functional as F
+
+for i in range(2):
+  top_5_tokens = torch.topk(mask_token_logits[i], 5, dim=0).indices.tolist()
+  for token in top_5_tokens:
+    print(sequences[i].replace(tokenizer.mask_token, tokenizer.decode([token])))
+
+                                                                                                                   
+probs = F.softmax(mask_token_logits, dim=-1).squeeze(1)      
+
+for _ in range(10):                                                                                                                          
+ next_token = torch.multinomial(probs, num_samples=1).squeeze(1)     
+ print(next_token.size())
+ for i in next_token:
+    print(tokenizer.decode([int(i)]))
+
+
+import re
+
+#quit()
+
+
+sentences = []
+with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/train.tsv", "r") as inFile:
+  header = next(inFile) # for the header
+  assert header == "sentence\tlabel\n"
+#  next(inFile)
+  for line in inFile:
+     line = line.strip().split("\t")
+     if len(line) < 2:
+       continue
+     assert len(line) == 2
+     sentences.append(line[0])
+random.shuffle(sentences)
+
+sentences_dev = []
+with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev.tsv", "r") as inFile:
+  header = next(inFile) # for the header
+  assert header == "sentence\tlabel\n"
+  for line in inFile:
+     line = line.strip().split("\t")
+     if len(line) < 2:
+       continue
+     assert len(line) == 2
+     sentences_dev.append(line[0])
+
+
+
+GENERATION_VOCABULARY_MASK = torch.cuda.FloatTensor([float("-inf") if ("<unk>" == tokenizer.convert_ids_to_tokens(x)) else 0 for x in range(30522)]).view(1, 1, -1)
+
+blankCandidates = []
+
+from transformers import AdamW
+LR = random.choice([2e-6, 5e-6, 1e-5, 2e-5, 5e-5, 1e-4])
+
+optimizer = AdamW(model.parameters(),
+                  lr = LR, # args.learning_rate - default is 5e-5, our notebook had 2e-5
+                  eps = 1e-8 # args.adam_epsilon  - default is 1e-8.
+                )
+
+
+from transformers import get_linear_schedule_with_warmup
+
+# Number of training epochs. The RoBERTa authors recommend between 2 and 4. 
+# We chose to run for 4, but we'll see later that this may be over-fitting the
+# training data.
+epochs = random.choice([1,2,3,4])
+
+BATCH = random.choice([4, 8, 16, 32]) # , 64, 128
+
+# Total number of training steps is [number of batches] x [number of epochs]. 
+# (Note that this is not the same as the number of training samples).
+total_steps = int(len(sentences)/BATCH * epochs)
+
+# Create the learning rate scheduler.
+scheduler = get_linear_schedule_with_warmup(optimizer, 
+                                            num_warmup_steps = 0, # Default value in run_glue.py
+                                            num_training_steps = total_steps)
+
+# http://mccormickml.com/2019/07/22/RoBERTa-fine-tuning/#4-train-our-classification-model
+
+model.train()
+
+
+ce_loss = torch.nn.CrossEntropyLoss(reduction="mean", ignore_index=-100)
+model.zero_grad()    
+
+def runOnCorpus(sents, doTraining):
+    if doTraining:
+       model.train()
+    else:
+        model.eval()
+    sents = sents[::]
+    random.shuffle(sents)
+    losses = []
+    counter = 0
+    sentsNum = len(sents)
+    while len(sents) > 0:
+      counter += BATCH
+      inputs = [tokenizer.encode(x, return_tensors="pt").view(-1) for x in sents[:BATCH]]
+      sents = sents[BATCH:]
+#      print(inputs)
+ #     print([x.size()[0] for x in inputs]) 
+
+
+      masked = [[(i, int(x[i])) for i in range(1,x.size()[0]-1) if random.random() < 0.2] for x in inputs]
+      for i in range(len(inputs)):
+        for j, _ in masked[i]:
+           inputs[i][j] = tokenizer.convert_tokens_to_ids("<mask>")
+#      if doTraining:
+ #        print(tokenizer.decode(inputs[0]))
+
+      maxLength = max([x.size()[0] for x in inputs])
+      for i in range(len(inputs)):
+          inputs[i] = torch.cat([inputs[i], torch.LongTensor([tokenizer.convert_tokens_to_ids("<pad>") for _ in range(maxLength - inputs[i].size()[0])])])
+
+   #   print([x.size()[0] for x in inputs]) 
+      inputs = torch.stack(inputs, dim=0)
+      inputs = inputs.cuda()
+      # now do masking
+ #     print(inputs[0])
+  #    print(inputs[1])
+
+      token_logits = model(inputs.cuda())
+    #  print(token_logits)
+      token_logits = token_logits[0]
+      targets = [[-100 for _ in range(maxLength)] for _ in range(len(masked))]
+      for i in range(len(masked)):
+         for j, targ in masked[i]:
+            targets[i][j] = targ
+   #   print(masked[0])
+  #    print(targets[0])
+ #     print(inputs[0])
+#      quit()
+      targets = torch.cuda.LongTensor(targets)
+      lossHere = ce_loss(token_logits.view(-1, token_logits.size()[-1]), targets.view(-1))
+#      print(targets[0])     
+#      print(lossHere)
+      losses.append(float(lossHere))                                                                                                        
+ #      ceLoss = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=6)(next_token_logits.view(-1, 32000), input_ids[:, LENGTH_OF_INITIAL_PART:].contiguous().view(-1))                                 
+  #    # print(ceLoss)                                                                                                                                                                                       
+   #    loss = ceLoss.mean()                                                                                                                                                                                 
+                                                                                                                                                                                                            
+      if doTraining:                                                                                                                                                                                       
+          model.zero_grad()                                                                                                                                                                                 
+          lossHere.backward()    
+          torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)                                                                                                                                           
+          optimizer.step()                                                                                                                                                                                  
+          scheduler.step()  # Update learning rate schedule                                                                                                                                                 
+      if random.random() < 0.2:
+        print(devLosses, float(lossHere), doTraining, (counter)/sentsNum, total_steps, epochs, LR, BATCH)
+    return sum(losses)/len(losses)
+
+devLosses = []
+
+model.eval()
+devLosses.append(runOnCorpus(sentences_dev, False))
+myID = random.randint(100,100000)
+
+for i in range(5):
+   model.train()
+   runOnCorpus(sentences, True)
+   model.eval() 
+   devLosses.append(runOnCorpus(sentences_dev, False))
+   with open(f"output/{__file__}_{myID}.txt", "w") as outFile:
+        print(devLosses, file=outFile)
+        print(total_steps, epochs, LR, BATCH, file=outFile)
+   if devLosses[-1] > devLosses[-2]:
+      break
+
+quit()
+
+blankCandidates = []
+
+try:
+ with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev_alternatives_c_sentBreak_new_finetuned_large.tsv", "r") as inFile:
+   for line in inFile:
+       if line.startswith("####"):
+          next(inFile)
+          tokenized = next(inFile).strip() # tokenized by the original XLNET tokenizer
+          print("TOK", tokenized)
+          line = next(inFile)
+       if len(line) < 3:
+        continue
+       try:
+          mask, sampled = line.strip().split("\t")
+       except ValueError:
+          continue
+       sampled = sampled.strip().split(" ")
+       mask = mask.strip()
+       assert len(sampled) == len(mask), (sampled, mask)
+       masked = [sampled[i] if mask[i] == "0" else "[MASK]" for i in range(len(mask))]
+       masked = "".join(masked).replace("▁", " ").replace("[MASK]", " [MASK] ").replace("  ", " ").replace("</s>", "").strip()
+       #print(("CANDIDATE", (tokenized, mask, masked)))
+       encodedWithMask = demo.encodeInputWithMask(masked, withCaching=True)
+       maskString = "".join(["0" if x != 103 else "1" for x in encodedWithMask])
+       blankCandidates.append({"tokenized" : tokenized, "XLNET_Mask" : mask, "masked" : masked, "PMLM_Encoded" : encodedWithMask, "PMLM_Mask_Encoded" : maskString})
+       #print(blankCandidates[-1])
+       if len(blankCandidates) % 1000 == 0:
+          #break
+          print("Recording blank candidates", len(blankCandidates))
+except StopIteration:
+    pass
+
+print(len(blankCandidates))
+queue = []
+
+blankCandidates = sorted(blankCandidates, key=lambda x:x["PMLM_Mask_Encoded"])
+
+#{'tokenized': "▁it ▁ ' s ▁a ▁charming ▁and ▁often ▁affecting ▁journey ▁ . </s>", 'XLNET_Mask': '1000000000000', 'masked': "[MASK] 's a charming and often affecting journey .", 'PMLM_Encoded': [101, 103, 112, 188, 170, 14186, 1105, 1510, 12759, 5012, 119, 102], 'PMLM_Mask_Encoded': '010000000000'}
+
+BATCHES = []
+i=0
+while i < len(blankCandidates):
+   if i+1 == len(blankCandidates):
+     j=i
+   else:
+     for j in range(i+1, min(len(blankCandidates), i+BATCH_SIZE+1)):
+        if not (blankCandidates[j]["PMLM_Mask_Encoded"].startswith(blankCandidates[i]["PMLM_Mask_Encoded"])):
+            break
+     j -= 1
+   BATCHES.append(blankCandidates[i:j+1])
+#   print(j-i, i,j, blankCandidates[j]["PMLM_Mask_Encoded"], blankCandidates[i]["PMLM_Mask_Encoded"], (blankCandidates[j]["PMLM_Mask_Encoded"].startswith(blankCandidates[i]["PMLM_Mask_Encoded"])), len(blankCandidates))
+   i = j+1
+print(len(BATCHES))
+print(sum([len(x) for x in BATCHES])/len(BATCHES))
+
+
+quit()
+
+count = 0
+with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev_alternatives_PMLM_Wikitext_finetune.tsv", "w") as outFile:
+  for batch in BATCHES:
+     count += 1
+     if count % 100:
+       print("fraction of all batches", count/len(BATCHES))
+       print(batch[-1])
+       print("MASK", batch[-1]["PMLM_Mask_Encoded"])
+     while len(batch) < BATCH_SIZE:
+       batch = (batch+batch)[:BATCH_SIZE]
+     numeric = [x["PMLM_Encoded"] for x in batch]
+     generated = demo.generate_text_from_numeric(numeric) # generate texts containing the tokens in right-to-left order
+     assert len(generated) == len(batch)
+     for b,g in zip(batch, generated):
+         print(b["XLNET_Mask"], "\t", b["tokenized"], "\t", g.strip(), file=outFile)
+
+
+
+
+

@@ -1,4 +1,6 @@
 
+# 10 for python35, 9 for python-jiant
+#export LD_LIBRARY_PATH=/usr/local/cuda-10.0/lib64:$LD_LIBRARY_PATH
 #export LD_LIBRARY_PATH=/usr/local/cuda-9.0/lib64:$LD_LIBRARY_PATH
 #export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 #jiant environment
@@ -21,6 +23,10 @@ import os
 import numpy as np
 import tensorflow as tf
 import tokenization
+
+# https://stackoverflow.com/questions/43990046/tensorflow-blas-gemm-launch-failed/52132383#52132383
+#physical_devices = tf.config.list_physical_devices('GPU') 
+#tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
 def top_k_logits(logits, k):
   if k == 0:
@@ -1469,13 +1475,14 @@ if __name__ == '__main__':
 
 blankCandidates = []
 
-for group in ["", "_d", "_e"]:
+for group in ["_c", "_d", "_e", "_f", "_g", "_h", "_i"]:
  try:
-  with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev_alternatives_c_sentBreak_new_finetuned_large"+group+".tsv", "r") as inFile:
+  with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/MNLI/dev_alternatives"+group+".tsv", "r") as inFile:
    for line in inFile:
        if line.startswith("####"):
           next(inFile)
-          tokenized = next(inFile).strip() # tokenized by the original XLNET tokenizer
+          boundary = int(next(inFile).strip())
+          tokenized = next(inFile).strip()
           print("TOK", tokenized)
           line = next(inFile)
        if len(line) < 3:
@@ -1485,14 +1492,19 @@ for group in ["", "_d", "_e"]:
        except ValueError:
           continue
        sampled = sampled.strip().split(" ")
+       assert len(sampled) == len(tokenized.split(" ")), (sampled, tokenized)
        mask = mask.strip()
        assert len(sampled) == len(mask), (sampled, mask)
        masked = [sampled[i] if mask[i] == "0" else "[MASK]" for i in range(len(mask))]
+       masked = masked[:boundary] + ["▁[SEP]", "▁[CLS]"] + masked[boundary:] # "▁[CLS]"
+       #print(masked)
        masked = "".join(masked).replace("▁", " ").replace("[MASK]", " [MASK] ").replace("  ", " ").replace("</s>", "").strip()
        #print(("CANDIDATE", (tokenized, mask, masked)))
        encodedWithMask = demo.encodeInputWithMask(masked, withCaching=True)
+#       lengthOfFirstPartPMLM = encodedWithMask.index(102)
+ #      encodedWithMask = encodedWithMask[:lengthOfFirstPartPMLM] + encodedWithMask[lengthOfFirstPartPMLM+1:]
        maskString = "".join(["0" if x != 103 else "1" for x in encodedWithMask])
-       blankCandidates.append({"tokenized" : tokenized, "XLNET_Mask" : mask, "masked" : masked, "PMLM_Encoded" : encodedWithMask, "PMLM_Mask_Encoded" : maskString})
+       blankCandidates.append({"tokenized" : tokenized, "XLNET_Mask" : mask, "masked" : masked, "PMLM_Encoded" : encodedWithMask, "PMLM_Mask_Encoded" : maskString}) #, "lengthOfFirstPartPMLM" : lengthOfFirstPartPMLM})
        #print(blankCandidates[-1])
        if len(blankCandidates) % 1000 == 0:
           #break
@@ -1525,7 +1537,7 @@ print(sum([len(x) for x in BATCHES])/len(BATCHES))
 import random
 random.shuffle(BATCHES)
 count = 0
-with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/SST-2/dev_alternatives_PMLM_"+MODEL_NAME.split('/')[-2]+"_raw.tsv", "w") as outFile:
+with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/MNLI/dev_alternatives_PMLM_"+MODEL_NAME.split('/')[-2]+"_raw.tsv", "w") as outFile:
   for batch in BATCHES:
      count += 1
      if count % 100:

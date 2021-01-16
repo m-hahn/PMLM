@@ -1,4 +1,6 @@
 
+# 10 for python35, 9 for python-jiant
+#export LD_LIBRARY_PATH=/usr/local/cuda-10.0/lib64:$LD_LIBRARY_PATH
 #export LD_LIBRARY_PATH=/usr/local/cuda-9.0/lib64:$LD_LIBRARY_PATH
 #export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 #jiant environment
@@ -21,6 +23,10 @@ import os
 import numpy as np
 import tensorflow as tf
 import tokenization
+
+# https://stackoverflow.com/questions/43990046/tensorflow-blas-gemm-launch-failed/52132383#52132383
+#physical_devices = tf.config.list_physical_devices('GPU') 
+#tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
 def top_k_logits(logits, k):
   if k == 0:
@@ -1340,7 +1346,9 @@ class BertModelDemo():
     self.output = self.model.get_predicted_tokens()
     saver = tf.train.Saver()
     print ("start restoring para")
-    self.sess = tf.Session()
+    self.sess = tf.Session() #config=tf.ConfigProto()) # mhahn experimental change
+    #print(tf.test.is_gpu_available())
+    #quit()
     saver.restore(self.sess, model_name)
     print ("model restoring completed")
     self.encodedInputCache = {}
@@ -1471,7 +1479,7 @@ blankCandidates = []
 
 for group in ["_c"]:
  try:
-  with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/MRPC/dev_alternatives{group}.tsv", "r") as inFile:
+  with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/MRPC/dev_alternatives"+group+".tsv", "r") as inFile:
    for line in inFile:
        if line.startswith("####"):
           next(inFile)
@@ -1531,7 +1539,7 @@ print(sum([len(x) for x in BATCHES])/len(BATCHES))
 import random
 random.shuffle(BATCHES)
 count = 0
-with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/MRPC/dev_alternatives_PMLM_{MODEL_NAME.split('/')[-2]}_raw.tsv", "w") as outFile:
+with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/MRPC/dev_alternatives_PMLM_"+MODEL_NAME.split('/')[-2]+"_raw.tsv", "w") as outFile:
   for batch in BATCHES:
      count += 1
      if count % 100:

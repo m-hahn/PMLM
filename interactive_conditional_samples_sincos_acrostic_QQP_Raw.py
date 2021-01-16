@@ -1479,11 +1479,11 @@ blankCandidates = []
 
 for group in ["_c"]:
  try:
-  with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/MRPC/dev_alternatives"+group+".tsv", "r") as inFile:
+  with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/QQP/dev_alternatives"+group+".tsv", "r") as inFile:
    for line in inFile:
        if line.startswith("####"):
           next(inFile)
-          boundary = int(next(inFile).strip())
+          boundary = [int(x) for x in next(inFile).strip().split(" ")][0]+1
           tokenized = next(inFile).strip()
           print("TOK", tokenized)
           line = next(inFile)
@@ -1531,7 +1531,8 @@ while i < len(blankCandidates):
         if not (blankCandidates[j]["PMLM_Mask_Encoded"].startswith(blankCandidates[i]["PMLM_Mask_Encoded"])):
             break
      j -= 1
-   BATCHES.append(blankCandidates[i:j+1])
+   if j > i+2: # make sure we don't waste compute on excessively small batches
+      BATCHES.append(blankCandidates[i:j+1])
 #   print(j-i, i,j, blankCandidates[j]["PMLM_Mask_Encoded"], blankCandidates[i]["PMLM_Mask_Encoded"], (blankCandidates[j]["PMLM_Mask_Encoded"].startswith(blankCandidates[i]["PMLM_Mask_Encoded"])), len(blankCandidates))
    i = j+1
 print(len(BATCHES))
@@ -1539,7 +1540,7 @@ print(sum([len(x) for x in BATCHES])/len(BATCHES))
 import random
 random.shuffle(BATCHES)
 count = 0
-with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/MRPC/dev_alternatives_PMLM_"+MODEL_NAME.split('/')[-2]+"_raw.tsv", "w") as outFile:
+with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/QQP/dev_alternatives_PMLM_"+MODEL_NAME.split('/')[-2]+"_raw.tsv", "w") as outFile:
   for batch in BATCHES:
      count += 1
      if count % 100:

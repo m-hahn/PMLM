@@ -1479,7 +1479,7 @@ blankCandidates = []
 
 for group in ["_c"]:
  try:
-  with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/MRPC/dev_alternatives"+group+".tsv", "r") as inFile:
+  with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/QNLI/dev_alternatives"+group+".tsv", "r") as inFile:
    for line in inFile:
        if line.startswith("####"):
           next(inFile)
@@ -1539,7 +1539,7 @@ print(sum([len(x) for x in BATCHES])/len(BATCHES))
 import random
 random.shuffle(BATCHES)
 count = 0
-with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/MRPC/dev_alternatives_PMLM_"+MODEL_NAME.split('/')[-2]+"_raw.tsv", "w") as outFile:
+with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/QNLI/dev_alternatives_PMLM_"+MODEL_NAME.split('/')[-2]+"_raw.tsv", "w") as outFile:
   for batch in BATCHES:
      count += 1
      if count % 100:

@@ -1,6 +1,4 @@
 
-# 10 for python35, 9 for python-jiant
-#export LD_LIBRARY_PATH=/usr/local/cuda-10.0/lib64:$LD_LIBRARY_PATH
 #export LD_LIBRARY_PATH=/usr/local/cuda-9.0/lib64:$LD_LIBRARY_PATH
 #export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 #jiant environment
@@ -23,10 +21,6 @@ import os
 import numpy as np
 import tensorflow as tf
 import tokenization
-
-# https://stackoverflow.com/questions/43990046/tensorflow-blas-gemm-launch-failed/52132383#52132383
-#physical_devices = tf.config.list_physical_devices('GPU') 
-#tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
 def top_k_logits(logits, k):
   if k == 0:
@@ -1346,9 +1340,7 @@ class BertModelDemo():
     self.output = self.model.get_predicted_tokens()
     saver = tf.train.Saver()
     print ("start restoring para")
-    self.sess = tf.Session(config=tf.ConfigProto()) # mhahn experimental change
-    #print(tf.test.is_gpu_available())
-    #quit()
+    self.sess = tf.Session()
     saver.restore(self.sess, model_name)
     print ("model restoring completed")
     self.encodedInputCache = {}
@@ -1477,9 +1469,12 @@ if __name__ == '__main__':
 
 blankCandidates = []
 
+from collections import defaultdict
+sideCache = defaultdict(int)
+
 for group in ["_c"]:
  try:
-  with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/MRPC/dev_alternatives"+group+".tsv", "r") as inFile:
+  with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/RTE/dev_alternatives{group}.tsv", "r") as inFile:
    for line in inFile:
        if line.startswith("####"):
           next(inFile)
@@ -1498,19 +1493,28 @@ for group in ["_c"]:
        mask = mask.strip()
        assert len(sampled) == len(mask), (sampled, mask)
        masked = [sampled[i] if mask[i] == "0" else "[MASK]" for i in range(len(mask))]
-       masked = masked[:boundary] + ["▁[SEP]", "▁[CLS]"] + masked[boundary:] # "▁[CLS]"
-       #print(masked)
-       masked = "".join(masked).replace("▁", " ").replace("[MASK]", " [MASK] ").replace("  ", " ").replace("</s>", "").strip()
-       #print(("CANDIDATE", (tokenized, mask, masked)))
-       encodedWithMask = demo.encodeInputWithMask(masked, withCaching=True)
-#       lengthOfFirstPartPMLM = encodedWithMask.index(102)
- #      encodedWithMask = encodedWithMask[:lengthOfFirstPartPMLM] + encodedWithMask[lengthOfFirstPartPMLM+1:]
-       maskString = "".join(["0" if x != 103 else "1" for x in encodedWithMask])
-       blankCandidates.append({"tokenized" : tokenized, "XLNET_Mask" : mask, "masked" : masked, "PMLM_Encoded" : encodedWithMask, "PMLM_Mask_Encoded" : maskString}) #, "lengthOfFirstPartPMLM" : lengthOfFirstPartPMLM})
-       #print(blankCandidates[-1])
-       if len(blankCandidates) % 1000 == 0:
-          #break
-          print("Recording blank candidates", len(blankCandidates))
+       masked_pair = [masked[:boundary], masked[boundary:]] # "▁[CLS]"
+       masks_pair = [mask[:boundary], mask[boundary:]]
+       for side, masked, mask_side in zip(range(2), masked_pair, masks_pair):
+         assert len(masked) == len(mask_side)
+         #print(masked)
+         masked = "".join(masked).replace("▁", " ").replace("[MASK]", " [MASK] ").replace("  ", " ").replace("</s>", "").strip()
+         if "[MASK]" not in masked:
+            continue
+         #print(("CANDIDATE", (tokenized, mask, masked)))
+         encodedWithMask = demo.encodeInputWithMask(masked, withCaching=True)
+  #       lengthOfFirstPartPMLM = encodedWithMask.index(102)
+   #      encodedWithMask = encodedWithMask[:lengthOfFirstPartPMLM] + encodedWithMask[lengthOfFirstPartPMLM+1:]
+         maskString = "".join(["0" if x != 103 else "1" for x in encodedWithMask])
+         key = (tokenized, mask_side+"_SIDE_"+str(side))
+         if sideCache[key] > 10:
+           continue
+         sideCache[key] += 1
+         blankCandidates.append({"tokenized" : tokenized, "XLNET_Mask" : mask_side+"_SIDE_"+str(side), "masked" : masked, "PMLM_Encoded" : encodedWithMask, "PMLM_Mask_Encoded" : maskString}) #, "lengthOfFirstPartPMLM" : lengthOfFirstPartPMLM})
+         #print(blankCandidates[-1])
+         if len(blankCandidates) % 1000 == 0:
+            #break
+            print("Recording blank candidates", len(blankCandidates))
  except StopIteration:
     pass
 
@@ -1531,8 +1535,7 @@ while i < len(blankCandidates):
         if not (blankCandidates[j]["PMLM_Mask_Encoded"].startswith(blankCandidates[i]["PMLM_Mask_Encoded"])):
             break
      j -= 1
-   if j > i+2:
-      BATCHES.append(blankCandidates[i:j+1])
+   BATCHES.append(blankCandidates[i:j+1])
 #   print(j-i, i,j, blankCandidates[j]["PMLM_Mask_Encoded"], blankCandidates[i]["PMLM_Mask_Encoded"], (blankCandidates[j]["PMLM_Mask_Encoded"].startswith(blankCandidates[i]["PMLM_Mask_Encoded"])), len(blankCandidates))
    i = j+1
 print(len(BATCHES))
@@ -1540,7 +1543,7 @@ print(sum([len(x) for x in BATCHES])/len(BATCHES))
 import random
 random.shuffle(BATCHES)
 count = 0
-with open("/u/scr/mhahn/PRETRAINED/GLUE/glue_data/MRPC/dev_alternatives_PMLM_"+MODEL_NAME.split('/')[-2]+"_raw.tsv", "w") as outFile:
+with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/RTE/dev_alternatives_PMLM_{MODEL_NAME.split('/')[-2]}_raw_Separately.tsv", "w") as outFile:
   for batch in BATCHES:
      count += 1
      if count % 100:

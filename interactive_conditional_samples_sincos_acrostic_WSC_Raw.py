@@ -1420,7 +1420,7 @@ class BertModelDemo():
     return 
 
 
-  def  generate_text_from_numeric(self, numeric):
+  def generate_text_from_numeric(self, numeric, antecedentPositions, pronounPositions):
     numeric_original = [x[::] for x in numeric]
     TEXT_LENGTH = max(len(x) for x in numeric)
     assert len(numeric) == BATCH_SIZE
@@ -1455,12 +1455,30 @@ class BertModelDemo():
       generated_strings = []
       for i in range(self.batch_size):
          out_numeric = out_combo[0][i]
+         pronoun = pronounPositions[i]
+         antecedent = antecedentPositions[i]
  #        print(len(out_numeric), len(numeric[i]))
 #         print(out_numeric.size)
          assert out_numeric.size >= len(numeric_original[i])
-         out_numeric = out_numeric[:len(numeric_original[i])]
+         out_numeric = out_numeric[:len(numeric_original[i])].tolist()
+         if pronoun[0] < antecedent[0]:
+            out_numeric.insert(pronoun[0], 102)
+            out_numeric.insert(pronoun[1]+1, 102)
+            out_numeric.insert(antecedent[0]+2, 102)
+            out_numeric.insert(antecedent[1]+3, 102)
+         else:
+            out_numeric.insert(antecedent[0], 102)
+            out_numeric.insert(antecedent[1]+1, 102)
+            out_numeric.insert(pronoun[0]+2, 102)
+            out_numeric.insert(pronoun[1]+3, 102)
+
+     
          final_output =  (' '.join(BertModel.decodetext(out_numeric,vocab_file=self.vocab_file,do_lower_case = self.do_lower_case)))
+         print("WITH MARKED UP ENTITIES", final_output, pronoun, antecedent)
  #        print ("The generated text is:", bert_iter, i, self.batch_size)
+         final_output = final_output.split("[SEP]")
+         #print(final_output)
+         final_output = final_output[0].strip() + " _ " + final_output[1].strip() + " _ " + final_output[2].strip() + " [ " + final_output[3].strip() + " ] " + ("[SEP]".join(final_output[4:] ))
          if i == 0:
             print (final_output.replace(" ##",""))
    #      print ("\n")
@@ -1516,9 +1534,10 @@ for group in ["_c"]:
        masked.insert(referents[1], "▁[SEP] ")
        masked.insert(referents[0], "▁[SEP] ")
 
-  #     print(1539, REFERENT1)
- #      print(1540, REFERENT2)
-#
+#       print(masked)
+#       print(1539, REFERENT1)
+#       print(1540, REFERENT2)
+##
 
        maskedPure = "".join(maskedPure).replace("▁", " ").replace("[MASK]", " [MASK] ").replace("  ", " ").replace("</s>", "").strip()
        #print(("CANDIDATE", (tokenized, mask, masked)))
@@ -1540,6 +1559,14 @@ for group in ["_c"]:
        underscores[3] -= 3
        underscores[2] -= 2
        underscores[1] -= 1
+
+       if referents_Original[0] < referents_Original[2]:
+           antecedents = underscores[:2]
+           pronouns = underscores[2:]
+       else:
+           antecedents = underscores[2:]
+           pronouns = underscores[:2]
+
    #    if referents[0] > referents[2]:
   #        underscores = underscores[2:] + underscores[:2]
        REFERENT1_ = (" ".join(BertModel.decodetext([x for x in masked_list[underscores[0]:underscores[1]]], vocab_file="en_vocab.txt",do_lower_case = False))).replace(" ##", "")
@@ -1562,7 +1589,14 @@ for group in ["_c"]:
  #      encodedWithMask = encodedWithMask[:lengthOfFirstPartPMLM] + encodedWithMask[lengthOfFirstPartPMLM+1:]
        maskString = "".join(["0" if x != 103 else "1" for x in encodedWithMaskPure])
        assert len(maskString) == len(encodedWithMaskPure)
-       blankCandidates.append({"tokenized" : tokenized_, "XLNET_Mask" : mask, "masked" : masked, "PMLM_Encoded" : encodedWithMaskPure, "PMLM_Mask_Encoded" : maskString}) #, "lengthOfFirstPartPMLM" : lengthOfFirstPartPMLM})
+       blankCandidates.append({"tokenized" : tokenized+"@REFERENTS@"+"@".join([str(y) for y in referents]), "XLNET_Mask" : mask, "masked" : masked, "PMLM_Encoded" : encodedWithMaskPure, "PMLM_Mask_Encoded" : maskString, "AntecedentPositions" : antecedents, "PronounPositions" : pronouns}) #, "lengthOfFirstPartPMLM" : lengthOfFirstPartPMLM})
+
+
+#     antecedentPositions = [x["AntecedentPositions"] for x in batch]
+ #    pronounPositions = [x["PronounPositions"] for x in batch]
+
+
+
        #print(blankCandidates[-1])
        if len(blankCandidates) % 1000 == 0:
           #break
@@ -1608,12 +1642,17 @@ with open("/u/scr/mhahn/PRETRAINED/WSC/val_alternatives_PMLM_"+MODEL_NAME.split(
        print("MASK", batch[-1]["PMLM_Mask_Encoded"])
      while len(batch) < BATCH_SIZE:
        batch = (batch+batch)[:BATCH_SIZE]
-     numeric = [x["PMLM_Encoded"] for x in batch]
-     generated = demo.generate_text_from_numeric(numeric) # generate texts containing the tokens in right-to-left order
+     numeric = [x["PMLM_Encoded"][::] for x in batch] # copy the lists for safety
+     antecedentPositions = [x["AntecedentPositions"] for x in batch]
+     pronounPositions = [x["PronounPositions"] for x in batch]
+
+     generated = demo.generate_text_from_numeric(numeric, antecedentPositions, pronounPositions) # generate texts containing the tokens in right-to-left order
      assert len(generated) == len(batch)
      for b,g in zip(batch, generated):
          print(b["XLNET_Mask"], "\t", b["tokenized"], "\t", g.strip(), file=outFile)
-
+#         print("WEIRD", g, b)
+ #        if (b["tokenized"].index("[") < b["tokenized"].index("_")) != (g.index("[ ") < g.index("_")):
+  #          print("WEIRD", g, b)
 
 
 

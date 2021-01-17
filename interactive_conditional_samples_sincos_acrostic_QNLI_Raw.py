@@ -1366,6 +1366,8 @@ class BertModelDemo():
            single_text = [102]
         else:
            single_text = BertModel.encodetext(word, vocab_file = self.vocab_file, do_lower_case = self.do_lower_case)
+        if "[CLS]" in word: # sanity check, since there sometimes is `[ CLS]' in the output when CLS acts as a separator between the two spans, suggesting it wasn't processed into code 101
+            assert word == "[CLS]", word
 #        print("single_text", single_text)
         context_tokens.extend(single_text)
       #print(text_base)

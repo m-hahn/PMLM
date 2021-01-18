@@ -6,13 +6,9 @@
 
 #!/usr/bin/env python3
 
-
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
-
-import sys
-
 
 import random
 import collections
@@ -1344,7 +1340,7 @@ class BertModelDemo():
     self.output = self.model.get_predicted_tokens()
     saver = tf.train.Saver()
     print ("start restoring para")
-    self.sess = tf.Session(config=tf.ConfigProto()) # mhahn experimental change
+    self.sess = tf.Session()
     saver.restore(self.sess, model_name)
     print ("model restoring completed")
     self.encodedInputCache = {}
@@ -1473,12 +1469,14 @@ if __name__ == '__main__':
 
 blankCandidates = []
 
-try:
- with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/CoLA/dev_alternatives.tsv", "r") as inFile:
+for group in ["_c"]:
+ try:
+  with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/RTE/dev_alternatives{group}.tsv", "r") as inFile:
    for line in inFile:
        if line.startswith("####"):
           next(inFile)
-          tokenized = next(inFile).strip() # tokenized by the original XLNET tokenizer
+          boundary = int(next(inFile).strip())
+          tokenized = next(inFile).strip()
           print("TOK", tokenized)
           line = next(inFile)
        if len(line) < 3:
@@ -1488,21 +1486,24 @@ try:
        except ValueError:
           continue
        sampled = sampled.strip().split(" ")
+       assert len(sampled) == len(tokenized.split(" ")), (sampled, tokenized)
        mask = mask.strip()
        assert len(sampled) == len(mask), (sampled, mask)
        masked = [sampled[i] if mask[i] == "0" else "[MASK]" for i in range(len(mask))]
+       masked = masked[:boundary] + ["▁[SEP]", "▁[CLS]"] + masked[boundary:] # "▁[CLS]"
+       #print(masked)
        masked = "".join(masked).replace("▁", " ").replace("[MASK]", " [MASK] ").replace("  ", " ").replace("</s>", "").strip()
        #print(("CANDIDATE", (tokenized, mask, masked)))
        encodedWithMask = demo.encodeInputWithMask(masked, withCaching=True)
+#       lengthOfFirstPartPMLM = encodedWithMask.index(102)
+ #      encodedWithMask = encodedWithMask[:lengthOfFirstPartPMLM] + encodedWithMask[lengthOfFirstPartPMLM+1:]
        maskString = "".join(["0" if x != 103 else "1" for x in encodedWithMask])
-       blankCandidates.append({"tokenized" : tokenized, "XLNET_Mask" : mask, "masked" : masked, "PMLM_Encoded" : encodedWithMask, "PMLM_Mask_Encoded" : maskString})
+       blankCandidates.append({"tokenized" : tokenized, "XLNET_Mask" : mask, "masked" : masked, "PMLM_Encoded" : encodedWithMask, "PMLM_Mask_Encoded" : maskString}) #, "lengthOfFirstPartPMLM" : lengthOfFirstPartPMLM})
        #print(blankCandidates[-1])
        if len(blankCandidates) % 1000 == 0:
           #break
           print("Recording blank candidates", len(blankCandidates))
-except StopIteration:
-    pass
-except FileNotFoundError:
+ except StopIteration:
     pass
 
 print(len(blankCandidates))
@@ -1530,12 +1531,11 @@ print(sum([len(x) for x in BATCHES])/len(BATCHES))
 import random
 random.shuffle(BATCHES)
 count = 0
-#with open(f"/u/scr/mhahn/PRETRAINED/textclas/{DATASET}_alternatives_PMLM_"+MODEL_NAME.split('/')[-2]+"_raw.tsv", "w") as outFile:
-with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/CoLA/dev_alternatives_PMLM_"+MODEL_NAME.split('/')[-2]+"_raw.tsv", "w") as outFile:
+with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/RTE/dev_alternatives_PMLM_{MODEL_NAME.split('/')[-2]}_raw.tsv", "w") as outFile:
   for batch in BATCHES:
      count += 1
      if count % 100:
-       print("fraction of all batches", count/len(BATCHES), "CoLA")
+       print("fraction of all batches", count/len(BATCHES))
        print(batch[-1])
        print("MASK", batch[-1]["PMLM_Mask_Encoded"])
      while len(batch) < BATCH_SIZE:

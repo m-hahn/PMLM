@@ -1469,12 +1469,14 @@ if __name__ == '__main__':
 
 blankCandidates = []
 
+identifierForDatapoints = 0
 
 for group in ["_c"]:
  try:
   with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/RTE/dev_alternatives{group}_OnlySubsetsNoAlternatives.tsv", "r") as inFile:
    for line in inFile:
        if line.startswith("####"):
+          identifierForDatapoints += 1
           next(inFile)
           boundary = int(next(inFile).strip())
           tokenized = next(inFile).strip()
@@ -1482,6 +1484,10 @@ for group in ["_c"]:
           line = next(inFile)
        if len(line) < 3:
         continue
+       if identifierForDatapoints < 30: # the first ~30 already dealt with by the previous run (without OnlySubsets...)
+         continue
+       if identifierForDatapoints > 100: # for now, only look at the first 100 datapoints due to compute limitations
+         break
        try:
           mask, _ = line.strip().split("\t")
        except ValueError:

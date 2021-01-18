@@ -1469,9 +1469,10 @@ if __name__ == '__main__':
 
 blankCandidates = []
 
+
 for group in ["_c"]:
  try:
-  with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/RTE/dev_alternatives{group}.tsv", "r") as inFile:
+  with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/RTE/dev_alternatives{group}_OnlySubsetsNoAlternatives.tsv", "r") as inFile:
    for line in inFile:
        if line.startswith("####"):
           next(inFile)
@@ -1482,14 +1483,15 @@ for group in ["_c"]:
        if len(line) < 3:
         continue
        try:
-          mask, sampled = line.strip().split("\t")
+          mask, _ = line.strip().split("\t")
        except ValueError:
           continue
-       sampled = sampled.strip().split(" ")
-       assert len(sampled) == len(tokenized.split(" ")), (sampled, tokenized)
+#       sampled = sampled.strip().split(" ")
+#       assert len(sampled) == len(tokenized.split(" ")), (sampled, tokenized)
        mask = mask.strip()
-       assert len(sampled) == len(mask), (sampled, mask)
-       masked = [sampled[i] if mask[i] == "0" else "[MASK]" for i in range(len(mask))]
+       tokenized_ = tokenized.split(" ")
+       assert len(tokenized_) == len(mask), (tokenized_, mask)
+       masked = [tokenized_[i] if mask[i] == "0" else "[MASK]" for i in range(len(mask))]
        masked = masked[:boundary] + ["▁[SEP]", "▁[CLS]"] + masked[boundary:] # "▁[CLS]"
        #print(masked)
        masked = "".join(masked).replace("▁", " ").replace("[MASK]", " [MASK] ").replace("  ", " ").replace("</s>", "").strip()
@@ -1531,7 +1533,7 @@ print(sum([len(x) for x in BATCHES])/len(BATCHES))
 import random
 random.shuffle(BATCHES)
 count = 0
-with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/RTE/dev_alternatives_PMLM_{MODEL_NAME.split('/')[-2]}_raw.tsv", "w") as outFile:
+with open(f"/u/scr/mhahn/PRETRAINED/GLUE/glue_data/RTE/dev_alternatives_PMLM_{MODEL_NAME.split('/')[-2]}_raw_Independent.tsv", "w") as outFile:
   for batch in BATCHES:
      count += 1
      if count % 100:

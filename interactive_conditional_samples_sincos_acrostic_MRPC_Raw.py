@@ -1,3 +1,7 @@
+# Derived from Code provided by Yi Liao
+# See https://github.com/huawei-noah/Pretrained-Language-Model/tree/master/PMLM
+# and the u-PMLM paper: https://arxiv.org/pdf/2004.11579.pdf
+
 
 # 10 for python35, 9 for python-jiant
 #export LD_LIBRARY_PATH=/usr/local/cuda-10.0/lib64:$LD_LIBRARY_PATH

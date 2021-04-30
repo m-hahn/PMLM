@@ -1,3 +1,7 @@
+# Derived from Code provided by Yi Liao
+# See https://github.com/huawei-noah/Pretrained-Language-Model/tree/master/PMLM
+# and the u-PMLM paper: https://arxiv.org/pdf/2004.11579.pdf
+
 
 #export LD_LIBRARY_PATH=/usr/local/cuda-9.0/lib64:$LD_LIBRARY_PATH
 #export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
